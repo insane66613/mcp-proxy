@@ -10,6 +10,8 @@ from mcp import server, types
 from mcp.client.session import ClientSession
 from mcp.server.lowlevel.server import request_ctx
 
+from .output_schemas import apply_desktop_commander_output_schemas
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,6 +89,7 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
 
         async def _list_tools(_: t.Any) -> types.ServerResult:  # noqa: ANN401
             tools = await remote_app.list_tools()
+            apply_desktop_commander_output_schemas(tools)
             return types.ServerResult(tools)
 
         app.request_handlers[types.ListToolsRequest] = _list_tools
