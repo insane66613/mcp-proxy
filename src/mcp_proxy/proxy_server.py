@@ -11,6 +11,7 @@ from mcp.client.session import ClientSession
 from mcp.server.lowlevel.server import request_ctx
 
 from .output_schemas import apply_desktop_commander_output_schemas
+from .structured_content import enrich_call_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,7 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
                     meta=meta_dict,
                     progress_callback=progress_callback,
                 )
+                enrich_call_tool_result(req.params.name, result)
                 return types.ServerResult(result)
             except Exception as e:  # noqa: BLE001
                 return types.ServerResult(
