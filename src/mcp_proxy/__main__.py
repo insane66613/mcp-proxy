@@ -16,6 +16,7 @@ import sys
 import typing as t
 from importlib.metadata import version
 
+import anyio
 from httpx_auth import OAuth2ClientCredentials
 from mcp.client.stdio import StdioServerParameters
 
@@ -29,6 +30,32 @@ SSE_URL: t.Final[str | None] = os.getenv(
     "SSE_URL",
     None,
 )
+
+
+class _ExpectedStandaloneSseTeardownFilter(logging.Filter):
+    """Suppress the MCP SDK's known benign standalone-SSE teardown traceback.
+
+    MCP SDK v1.x closes the standalone GET stream during normal DELETE/session
+    teardown.  A writer already blocked in ``receive()`` can then resume with
+    ``anyio.ClosedResourceError``; released v1.x versions log that expected race
+    as an ERROR even though cleanup continues normally.  Current upstream code
+    handles this exact exception separately.
+
+    Keep the filter deliberately narrow so all other streamable-HTTP failures
+    remain visible.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "mcp.server.streamable_http":
+            return True
+        if record.getMessage() != "Error in standalone SSE writer":
+            return True
+        if not record.exc_info:
+            return True
+        return not isinstance(record.exc_info[1], anyio.ClosedResourceError)
+
+
+_EXPECTED_STANDALONE_SSE_TEARDOWN_FILTER = _ExpectedStandaloneSseTeardownFilter()
 
 
 def _normalize_verify_ssl(value: str | bool | None) -> bool | str | None:
@@ -281,6 +308,12 @@ def _setup_logging(*, level: str, debug: bool) -> logging.Logger:
         level=logging.DEBUG if debug else level,
         format="[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s] %(message)s",
     )
+    streamable_http_logger = logging.getLogger("mcp.server.streamable_http")
+    if not any(
+        isinstance(existing, _ExpectedStandaloneSseTeardownFilter)
+        for existing in streamable_http_logger.filters
+    ):
+        streamable_http_logger.addFilter(_EXPECTED_STANDALONE_SSE_TEARDOWN_FILTER)
     return logging.getLogger(__name__)
 
 
