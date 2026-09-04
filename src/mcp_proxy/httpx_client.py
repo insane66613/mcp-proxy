@@ -1,15 +1,55 @@
-"""HTTP request logging patch for MCP proxy.
+"""HTTP client factory with privacy-preserving connector observability."""
 
-This module patches the create_mcp_http_client function to add comprehensive
-request and response logging capabilities.
-"""
+from __future__ import annotations
 
+import ipaddress
 import logging
+import time
+from collections import deque
+from threading import Lock
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_REQUEST_WINDOW_SECONDS = 60.0
+_request_timestamps: deque[float] = deque()
+_request_rate_lock = Lock()
+
+
+def _destination_class(request: httpx.Request) -> str:
+    """Classify a destination without emitting host, port, path, or query data."""
+    host = (request.url.host or "").strip().lower().rstrip(".")
+    if host == "localhost":
+        return "loopback"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "public-network"
+    if address.is_loopback:
+        return "loopback"
+    if address.is_private or address.is_link_local:
+        return "private-network"
+    return "public-network"
+
+
+def _record_request_rate() -> int:
+    """Return the per-process request count in the trailing 60-second window."""
+    now = time.monotonic()
+    cutoff = now - _REQUEST_WINDOW_SECONDS
+    with _request_rate_lock:
+        while _request_timestamps and _request_timestamps[0] <= cutoff:
+            _request_timestamps.popleft()
+        _request_timestamps.append(now)
+        return len(_request_timestamps)
+
+
+def _sanitize_retry_after(value: str | None) -> str:
+    if not value:
+        return "-"
+    normalized = " ".join(value.split())[:128]
+    return normalized or "-"
 
 
 def custom_httpx_client(  # noqa: C901
@@ -18,10 +58,10 @@ def custom_httpx_client(  # noqa: C901
     auth: httpx.Auth | None = None,
     verify_ssl: bool | str | None = None,
 ) -> httpx.AsyncClient:
-    """Create a standardized httpx AsyncClient with MCP defaults and logging.
+    """Create a standardized HTTP client with bounded connector metrics.
 
-    This is a replacement for the original create_mcp_http_client that adds
-    comprehensive request/response logging capabilities.
+    Request observability intentionally excludes URLs, headers, cookies, bodies,
+    and conversation content; only coarse destination and rate metadata is logged.
 
     Args:
         headers: Optional headers to include with all requests.
@@ -79,39 +119,29 @@ def custom_httpx_client(  # noqa: C901
                 normalized_verify,
             )
 
-    # Add logging event hooks
+    # Record only the bounded metadata needed to attribute request-rate incidents.
     async def log_request(request: httpx.Request) -> None:
-        """Log HTTP request details."""
-        logger.info(
-            "HTTP Request: %s %s",
-            request.method,
-            request.url,
-        )
-
-        # Log headers (be careful with sensitive data)
-        if logger.isEnabledFor(logging.DEBUG) or True:
-            safe_headers = {}
-            for key, value in request.headers.items():
-                # Mask sensitive headers
-                if key.lower() in ("authorization", "x-api-key", "cookie"):
-                    safe_headers[key] = "***MASKED***"
-                else:
-                    safe_headers[key] = value
-            logger.info("Request Headers: %s", safe_headers)
+        request.extensions["sanitycloud_destination_class"] = _destination_class(request)
+        request.extensions["sanitycloud_requests_per_minute"] = _record_request_rate()
 
     async def log_response(response: httpx.Response) -> None:
-        """Log HTTP response details."""
-        logger.debug(
-            "HTTP Response: %s %s - %d %s",
-            response.request.method,
-            response.request.url,
-            response.status_code,
-            response.reason_phrase,
+        request = response.request
+        destination_class = str(
+            request.extensions.get("sanitycloud_destination_class") or _destination_class(request)
         )
-
-        # Log response headers
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Response Headers: %s", dict(response.headers))
+        requests_per_minute = int(
+            request.extensions.get("sanitycloud_requests_per_minute") or 0
+        )
+        retry_after = _sanitize_retry_after(response.headers.get("Retry-After"))
+        logger.info(
+            "destination_class=%s request_type=%s status=%d retry_after=%s "
+            "requests_per_minute=%d",
+            destination_class,
+            request.method,
+            response.status_code,
+            retry_after,
+            requests_per_minute,
+        )
 
     # Add event hooks
     kwargs["event_hooks"] = {
