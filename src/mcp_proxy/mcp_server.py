@@ -39,6 +39,7 @@ class MCPServerSettings:
     bind_host: str
     port: int
     stateless: bool = False
+    session_idle_timeout: float = 1800.0
     allow_origins: list[str] | None = None
     expose_headers: list[str] = field(default_factory=_default_expose_headers)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
@@ -77,6 +78,7 @@ def create_single_instance_routes(
     mcp_server_instance: MCPServerSDK[object],
     *,
     stateless_instance: bool,
+    session_idle_timeout: float = 1800.0,
 ) -> tuple[list[BaseRoute], StreamableHTTPSessionManager]:  # Return the manager itself
     """Create Starlette routes and the HTTP session manager for a single MCP server instance."""
     logger.debug(
@@ -90,6 +92,9 @@ def create_single_instance_routes(
         event_store=None,
         json_response=True,
         stateless=stateless_instance,
+        # SDK inactivity counts HTTP arrivals and can cancel long active calls;
+        # retain its recommended 30-minute bound rather than a short probe timeout.
+        session_idle_timeout=None if stateless_instance else session_idle_timeout,
     )
 
     async def handle_sse_instance(request: Request) -> Response:
@@ -108,6 +113,32 @@ def create_single_instance_routes(
         return Response()
 
     async def handle_streamable_http_instance(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") == "http":
+            request = Request(scope)
+            if request.method == "HEAD":
+                await Response(status_code=405, headers={"Allow": "GET, POST, DELETE"})(
+                    scope,
+                    receive,
+                    send,
+                )
+                return
+            if (
+                request.method == "GET"
+                and "mcp-session-id" not in request.headers
+                and not any(
+                    media_type.strip().startswith("text/event-stream")
+                    for media_type in request.headers.get("accept", "").split(",")
+                )
+            ):
+                await Response(
+                    "Not Acceptable: Client must accept text/event-stream",
+                    status_code=406,
+                )(
+                    scope,
+                    receive,
+                    send,
+                )
+                return
         _update_global_activity()
         updated_scope = scope
         if scope.get("type") == "http":
@@ -139,7 +170,12 @@ def create_single_instance_routes(
             methods=HTTP_METHODS,
             include_in_schema=False,
         ),
-        Mount("/mcp", app=handle_streamable_http_instance),
+        Route(
+            "/mcp/",
+            endpoint=_ASGIEndpointAdapter(handle_streamable_http_instance),
+            methods=HTTP_METHODS,
+            include_in_schema=False,
+        ),
         Route("/sse", endpoint=handle_sse_instance),
         Mount("/messages/", app=sse_transport.handle_post_message),
     ]
@@ -182,6 +218,7 @@ async def run_mcp_server(
             instance_routes, http_manager = create_single_instance_routes(
                 proxy,
                 stateless_instance=mcp_settings.stateless,
+                session_idle_timeout=mcp_settings.session_idle_timeout,
             )
             await stack.enter_async_context(http_manager.run())  # Manage lifespan by calling run()
             all_routes.extend(instance_routes)
@@ -202,6 +239,7 @@ async def run_mcp_server(
             instance_routes_named, http_manager_named = create_single_instance_routes(
                 proxy_named,
                 stateless_instance=mcp_settings.stateless,
+                session_idle_timeout=mcp_settings.session_idle_timeout,
             )
             await stack.enter_async_context(
                 http_manager_named.run(),

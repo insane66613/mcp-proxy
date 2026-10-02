@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 import uvicorn
+from httpx import ASGITransport, AsyncClient
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
@@ -18,6 +19,8 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import Response
+from starlette.routing import Mount
 
 from mcp_proxy.mcp_server import (
     DEFAULT_EXPOSE_HEADERS,
@@ -71,6 +74,106 @@ def create_starlette_app(
     )
     app.router.redirect_slashes = False
     return app
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("prefix", ["", "/servers/example"])
+async def test_discovery_requests_do_not_enter_session_manager(
+    *,
+    stateless: bool,
+    prefix: str,
+) -> None:
+    """Reject unsupported discovery requests before allocating any transport."""
+    server: Server[object, t.Any] = Server("TestServer")
+    routes, manager = create_single_instance_routes(server, stateless_instance=stateless)
+    app = Starlette(routes=[Mount(prefix, routes=routes)] if prefix else routes)
+    app.router.redirect_slashes = False
+    with patch.object(manager, "handle_request", new_callable=AsyncMock) as handle:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for path in ("/mcp", "/mcp/"):
+                for accept in ("", "application/json", "*/*", "text/*", "TEXT/EVENT-STREAM"):
+                    response = await client.get(prefix + path, headers={"Accept": accept})
+                    assert response.status_code == 406
+                response = await client.head(prefix + path)
+                assert response.status_code == 405
+                assert response.headers["allow"] == "GET, POST, DELETE"
+            for path in (
+                "/mcp/.well-known/oauth-protected-resource",
+                "/mcp/.well-known/openid-configuration",
+            ):
+                response = await client.get(prefix + path, headers={"Accept": "text/event-stream"})
+                assert response.status_code == 404
+        handle.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
+@pytest.mark.parametrize("prefix", ["", "/servers/example"])
+@pytest.mark.parametrize(
+    "accept",
+    ["application/json, text/event-stream;q=1", "text/event-stream;q=0", "text/event-streaming"],
+)
+async def test_valid_mcp_requests_reach_session_manager(
+    *,
+    stateless: bool,
+    path: str,
+    accept: str,
+    prefix: str,
+) -> None:
+    """Preserve initialization, SSE negotiation, and existing-session error handling."""
+    server: Server[object, t.Any] = Server("TestServer")
+    routes, manager = create_single_instance_routes(server, stateless_instance=stateless)
+    app = Starlette(routes=[Mount(prefix, routes=routes)] if prefix else routes)
+    app.router.redirect_slashes = False
+    with patch.object(
+        manager,
+        "handle_request",
+        new_callable=AsyncMock,
+        side_effect=Response().__call__,
+    ) as handle:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # Match the SDK's startswith acceptance, including its existing q=0/lookalike behavior.
+            await client.get(prefix + path, headers={"Accept": accept})
+            await client.get(prefix + path, headers={"mcp-session-id": "existing-session"})
+            await client.post(
+                prefix + path,
+                json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+            )
+            await client.delete(prefix + path, headers={"mcp-session-id": "existing-session"})
+        assert handle.await_count == 4
+
+
+@pytest.mark.parametrize(
+    ("stateless", "configured_timeout", "expected_timeout"),
+    [
+        (False, 1800.0, 1800.0),
+        (False, 123.0, 123.0),
+        (True, 1800.0, None),
+        (True, 123.0, None),
+    ],
+)
+def test_streamable_http_session_idle_timeout_configuration(
+    *,
+    stateless: bool,
+    configured_timeout: float,
+    expected_timeout: float | None,
+) -> None:
+    """Bound stateful sessions while keeping stateless transports timeout-free."""
+    server: Server[object, t.Any] = Server("TestServer")
+    _routes, manager = create_single_instance_routes(
+        server,
+        stateless_instance=stateless,
+        session_idle_timeout=configured_timeout,
+    )
+
+    assert manager.session_idle_timeout == expected_timeout
+
+
+def test_mcp_server_settings_default_session_idle_timeout_is_30_minutes() -> None:
+    """Default stateful session expiry should match the SDK's 30-minute guidance."""
+    settings = MCPServerSettings(bind_host="127.0.0.1", port=1234)
+
+    assert settings.session_idle_timeout == 1800.0
 
 
 class BackgroundServer(uvicorn.Server):
@@ -297,6 +400,7 @@ async def test_run_mcp_server_with_default_server(
         mock_create_routes.assert_called_once_with(
             mock_proxy,
             stateless_instance=mock_settings.stateless,
+            session_idle_timeout=mock_settings.session_idle_timeout,
         )
         mock_logger.info.assert_any_call(
             "Setting up default server: %s %s",
@@ -536,6 +640,7 @@ async def test_run_mcp_server_stateless_mode(
         mock_create_routes.assert_called_once_with(
             mock_proxy,
             stateless_instance=True,
+            session_idle_timeout=stateless_settings.session_idle_timeout,
         )
 
 
