@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Final, Literal
 
+import anyio
 import uvicorn
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -26,6 +27,7 @@ from .proxy_server import create_proxy_server
 logger = logging.getLogger(__name__)
 
 DEFAULT_EXPOSE_HEADERS: Final[tuple[str, ...]] = ("mcp-session-id",)
+MAX_HTTP_SESSIONS: Final[int] = 128
 
 
 def _default_expose_headers() -> list[str]:
@@ -74,7 +76,7 @@ async def _handle_status(_: Request) -> Response:
     return JSONResponse(_global_status)
 
 
-def create_single_instance_routes(
+def create_single_instance_routes(  # noqa: C901
     mcp_server_instance: MCPServerSDK[object],
     *,
     stateless_instance: bool,
@@ -96,6 +98,7 @@ def create_single_instance_routes(
         # retain its recommended 30-minute bound rather than a short probe timeout.
         session_idle_timeout=None if stateless_instance else session_idle_timeout,
     )
+    session_admission_lock = anyio.Lock()
 
     async def handle_sse_instance(request: Request) -> Response:
         async with sse_transport.connect_sse(
@@ -112,7 +115,9 @@ def create_single_instance_routes(
             )
         return Response()
 
-    async def handle_streamable_http_instance(scope: Scope, receive: Receive, send: Send) -> None:
+    async def handle_streamable_http_instance(  # noqa: C901, PLR0912
+        scope: Scope, receive: Receive, send: Send,
+    ) -> None:
         if scope.get("type") == "http":
             request = Request(scope)
             if request.method == "HEAD":
@@ -161,7 +166,28 @@ def create_single_instance_routes(
                     else:
                         updated_scope["raw_path"] = raw_path.rstrip(b"/") + b"/"
 
-        await http_session_manager.handle_request(updated_scope, receive, send)
+        session_id = Request(scope).headers.get("mcp-session-id")
+        if not stateless_instance and session_id is None:
+            # Serialize allocation checks so simultaneous initializations respect the bound.
+            async with session_admission_lock:
+                if len(http_session_manager._server_instances) >= MAX_HTTP_SESSIONS:  # noqa: SLF001
+                    await Response(
+                        "MCP session capacity reached", status_code=429,
+                        headers={"Retry-After": "30"},
+                    )(updated_scope, receive, send)
+                    return
+                await http_session_manager.handle_request(updated_scope, receive, send)
+        else:
+            transport = http_session_manager._server_instances.get(session_id)  # noqa: SLF001
+            try:
+                await http_session_manager.handle_request(updated_scope, receive, send)
+            finally:
+                # SDK v1 retains explicitly terminated transports after DELETE.
+                if (
+                    transport is not None and transport.is_terminated
+                    and http_session_manager._server_instances.get(session_id) is transport  # noqa: SLF001
+                ):
+                    http_session_manager._server_instances.pop(session_id, None)  # noqa: SLF001
 
     routes = [
         Route(
