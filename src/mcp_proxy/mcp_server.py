@@ -1,10 +1,12 @@
 """Create a local SSE server that proxies requests to a stdio MCP server."""
 
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http import HTTPStatus
 from typing import Any, Final, Literal
 
 import anyio
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EXPOSE_HEADERS: Final[tuple[str, ...]] = ("mcp-session-id",)
 MAX_HTTP_SESSIONS: Final[int] = 128
+SESSION_PRESSURE_GRACE_SECONDS: Final[float] = 30.0
 
 
 def _default_expose_headers() -> list[str]:
@@ -76,7 +79,7 @@ async def _handle_status(_: Request) -> Response:
     return JSONResponse(_global_status)
 
 
-def create_single_instance_routes(  # noqa: C901
+def create_single_instance_routes(  # noqa: C901, PLR0915
     mcp_server_instance: MCPServerSDK[object],
     *,
     stateless_instance: bool,
@@ -99,6 +102,25 @@ def create_single_instance_routes(  # noqa: C901
         session_idle_timeout=None if stateless_instance else session_idle_timeout,
     )
     session_admission_lock = anyio.Lock()
+    active_requests: dict[str, int] = {}
+    last_completed: dict[str, float] = {}
+
+    async def retire_session(session_id: str) -> bool:
+        transport = http_session_manager._server_instances.get(session_id)  # noqa: SLF001
+        if transport is None:
+            return True
+        # Remove admission before yielding so a new request cannot attach mid-retirement.
+        http_session_manager._server_instances.pop(session_id, None)  # noqa: SLF001
+        with anyio.move_on_after(5, shield=True):
+            await transport.terminate()
+        if not transport.is_terminated:
+            http_session_manager._server_instances.setdefault(session_id, transport)  # noqa: SLF001
+            return False
+        if http_session_manager._server_instances.get(session_id) is transport:  # noqa: SLF001
+            http_session_manager._server_instances.pop(session_id, None)  # noqa: SLF001
+        active_requests.pop(session_id, None)
+        last_completed.pop(session_id, None)
+        return True
 
     async def handle_sse_instance(request: Request) -> Response:
         async with sse_transport.connect_sse(
@@ -115,7 +137,7 @@ def create_single_instance_routes(  # noqa: C901
             )
         return Response()
 
-    async def handle_streamable_http_instance(  # noqa: C901, PLR0912
+    async def handle_streamable_http_instance(  # noqa: C901, PLR0912, PLR0915
         scope: Scope, receive: Receive, send: Send,
     ) -> None:
         if scope.get("type") == "http":
@@ -168,26 +190,122 @@ def create_single_instance_routes(  # noqa: C901
 
         session_id = Request(scope).headers.get("mcp-session-id")
         if not stateless_instance and session_id is None:
+            request = Request(scope, receive)
+            if request.method != "POST":
+                await Response("MCP session ID required", status_code=400)(
+                    updated_scope, receive, send,
+                )
+                return
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > 4 * 1024 * 1024:
+                    await Response("Initialization body too large", status_code=413)(
+                        updated_scope, receive, send,
+                    )
+                    return
+                body.extend(chunk)
+            try:
+                message = json.loads(body)
+            except (ValueError, UnicodeDecodeError):
+                message = None
+            if not isinstance(message, dict) or message.get("method") != "initialize":
+                await Response("Initialize a session first", status_code=400)(
+                    updated_scope, receive, send,
+                )
+                return
+
+            body_sent = False
+
+            async def replay_receive() -> dict[str, Any]:
+                nonlocal body_sent
+                if body_sent:
+                    return await receive()
+                body_sent = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+
             # Serialize allocation checks so simultaneous initializations respect the bound.
             async with session_admission_lock:
+                instances = http_session_manager._server_instances  # noqa: SLF001
+                for stale_id in last_completed.keys() - instances.keys():
+                    last_completed.pop(stale_id, None)
                 if len(http_session_manager._server_instances) >= MAX_HTTP_SESSIONS:  # noqa: SLF001
+                    candidates = [
+                        key for key in instances
+                        if not active_requests.get(key, 0)
+                        and anyio.current_time() - last_completed.get(key, anyio.current_time())
+                        >= SESSION_PRESSURE_GRACE_SECONDS
+                    ]
+                    if candidates:
+                        oldest = min(candidates, key=lambda key: last_completed[key])
+                        if await retire_session(oldest):
+                            logger.info("Reclaimed idle MCP session at capacity")
+                if len(instances) >= MAX_HTTP_SESSIONS:
+                    logger.warning(
+                        "MCP session capacity reached: sessions=%s active=%s",
+                        len(instances), sum(bool(active_requests.get(key, 0)) for key in instances),
+                    )
                     await Response(
                         "MCP session capacity reached", status_code=429,
                         headers={"Retry-After": "30"},
                     )(updated_scope, receive, send)
                     return
-                await http_session_manager.handle_request(updated_scope, receive, send)
+                previous_ids = set(instances)
+                response_status = 500
+
+                async def capture_send(message: dict[str, Any]) -> None:
+                    nonlocal response_status
+                    if message["type"] == "http.response.start":
+                        response_status = message["status"]
+                    await send(message)
+
+                try:
+                    await http_session_manager.handle_request(
+                        updated_scope, replay_receive, capture_send,
+                    )
+                finally:
+                    for new_id in set(instances) - previous_ids:
+                        last_completed[new_id] = anyio.current_time()
+                        if response_status >= HTTPStatus.BAD_REQUEST:
+                            await retire_session(new_id)
         else:
             transport = http_session_manager._server_instances.get(session_id)  # noqa: SLF001
+            active = Request(scope).method != "GET"
+            if active and transport is not None and session_id is not None:
+                active_requests[session_id] = active_requests.get(session_id, 0) + 1
+                if transport.idle_scope is not None:
+                    transport.idle_scope.deadline = float("inf")
+            elif (
+                transport is not None and session_id is not None
+                and transport.idle_scope is not None
+                and session_idle_timeout is not None and not active_requests.get(session_id, 0)
+            ):
+                # A passive event stream refreshes arrival time but cannot pin a session.
+                transport.idle_scope.deadline = anyio.current_time() + session_idle_timeout
             try:
-                await http_session_manager.handle_request(updated_scope, receive, send)
+                if transport is not None:
+                    # SDK resets the deadline on arrival, even for a long active call.
+                    await transport.handle_request(updated_scope, receive, send)
+                else:
+                    await http_session_manager.handle_request(updated_scope, receive, send)
             finally:
+                if active and transport is not None and session_id is not None:
+                    remaining = active_requests[session_id] - 1
+                    if remaining:
+                        active_requests[session_id] = remaining
+                    else:
+                        active_requests.pop(session_id, None)
+                        last_completed[session_id] = anyio.current_time()
+                        if transport.idle_scope is not None and session_idle_timeout is not None:
+                            transport.idle_scope.deadline = (
+                                anyio.current_time() + session_idle_timeout
+                            )
                 # SDK v1 retains explicitly terminated transports after DELETE.
                 if (
                     transport is not None and transport.is_terminated
                     and http_session_manager._server_instances.get(session_id) is transport  # noqa: SLF001
                 ):
                     http_session_manager._server_instances.pop(session_id, None)  # noqa: SLF001
+                    last_completed.pop(session_id, None)
 
     routes = [
         Route(

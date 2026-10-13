@@ -133,14 +133,15 @@ async def test_valid_mcp_requests_reach_session_manager(
     ) as handle:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             # Match the SDK's startswith acceptance, including its existing q=0/lookalike behavior.
-            await client.get(prefix + path, headers={"Accept": accept})
+            response = await client.get(prefix + path, headers={"Accept": accept})
+            assert response.status_code == (200 if stateless else 400)
             await client.get(prefix + path, headers={"mcp-session-id": "existing-session"})
             await client.post(
                 prefix + path,
                 json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
             )
             await client.delete(prefix + path, headers={"mcp-session-id": "existing-session"})
-        assert handle.await_count == 4
+        assert handle.await_count == (4 if stateless else 3)
 
 
 @pytest.mark.parametrize(

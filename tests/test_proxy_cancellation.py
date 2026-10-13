@@ -17,6 +17,154 @@ from mcp_proxy.mcp_server import create_single_instance_routes
 from mcp_proxy.proxy_server import create_proxy_server
 
 
+def test_pressure_reclaims_idle_sessions_but_preserves_active_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abandoned clients cannot block new ones or expire a running tool."""
+    monkeypatch.setattr(mcp_server, "MAX_HTTP_SESSIONS", 2)
+    monkeypatch.setattr(mcp_server, "SESSION_PRESSURE_GRACE_SECONDS", 0.02)
+
+    async def scenario() -> None:
+        entered, release = anyio.Event(), anyio.Event()
+        server = Server("pressure")
+
+        @server.list_tools()
+        async def list_tools() -> list[types.Tool]:
+            return [types.Tool(name="hang", inputSchema={"type": "object"})]
+
+        @server.call_tool()
+        async def call_tool(_name: str, _arguments: dict) -> list[types.TextContent]:
+            entered.set()
+            await release.wait()
+            return [types.TextContent(type="text", text="finished")]
+
+        routes, manager = create_single_instance_routes(
+            server, stateless_instance=False, session_idle_timeout=0.15,
+        )
+        headers = {"Accept": "application/json, text/event-stream"}
+        initialize = {
+            "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "pressure-test", "version": "1"},
+            },
+        }
+        with anyio.fail_after(3):
+            async with manager.run(), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=Starlette(routes=routes)),
+                base_url="http://localhost",
+            ) as client:
+                first = await client.post("/mcp", headers=headers, json=initialize)
+                active_id = first.headers["mcp-session-id"]
+                active_headers = {**headers, "mcp-session-id": active_id}
+                await client.post("/mcp", headers=active_headers, json={
+                    "jsonrpc": "2.0", "method": "notifications/initialized",
+                })
+
+                async def invoke() -> None:
+                    result = await client.post("/mcp", headers=active_headers, json={
+                        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                        "params": {"name": "hang", "arguments": {}},
+                    })
+                    assert result.json()["result"]["content"][0]["text"] == "finished"
+
+                async with anyio.create_task_group() as group:
+                    group.start_soon(invoke)
+                    await entered.wait()
+                    stream_scope = anyio.CancelScope()
+
+                    async def stream() -> None:
+                        with stream_scope:
+                            await client.get("/mcp", headers=active_headers)
+
+                    group.start_soon(stream)
+                    await anyio.sleep(0.01)
+                    stream_scope.cancel()
+                    second = await client.post("/mcp", headers=headers, json=initialize)
+                    idle_id = second.headers["mcp-session-id"]
+                    await anyio.sleep(0.04)
+                    third = await client.post("/mcp", headers=headers, json=initialize)
+                    assert third.status_code == HTTPStatus.OK
+                    assert idle_id not in manager._server_instances  # noqa: SLF001
+                    assert active_id in manager._server_instances  # noqa: SLF001
+                    await anyio.sleep(0.2)
+                    assert active_id in manager._server_instances  # noqa: SLF001
+                    assert not release.is_set()
+                    release.set()
+                await anyio.sleep(0.2)
+                assert active_id not in manager._server_instances  # noqa: SLF001
+
+    anyio.run(scenario)
+
+
+def test_invalid_headerless_requests_do_not_retain_sessions() -> None:
+    """Invalid discovery and initialization traffic consumes no persistent capacity."""
+
+    async def scenario() -> None:
+        routes, manager = create_single_instance_routes(Server("invalid"), stateless_instance=False)
+        headers = {"Accept": "application/json, text/event-stream"}
+        with anyio.fail_after(3):
+            async with manager.run(), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=Starlette(routes=routes)),
+                base_url="http://localhost",
+            ) as client:
+                response = await client.get("/mcp", headers=headers)
+                assert response.status_code == HTTPStatus.BAD_REQUEST
+                for body in (b"invalid-json", b'{"method":"ping"}', b'{"method":"initialize"}'):
+                    response = await client.post("/mcp", headers=headers, content=body)
+                    assert response.status_code == HTTPStatus.BAD_REQUEST
+                    assert not manager._server_instances  # noqa: SLF001
+                response = await client.post(
+                    "/mcp", headers=headers, content=b" " * (4 * 1024 * 1024 + 1),
+                )
+                assert response.status_code == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+                assert not manager._server_instances  # noqa: SLF001
+
+    anyio.run(scenario)
+
+
+def test_passive_sse_connection_does_not_pin_an_idle_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Listening for events cannot prevent reclamation of an otherwise idle session."""
+    monkeypatch.setattr(mcp_server, "MAX_HTTP_SESSIONS", 1)
+    monkeypatch.setattr(mcp_server, "SESSION_PRESSURE_GRACE_SECONDS", 0.01)
+
+    async def scenario() -> None:
+        routes, manager = create_single_instance_routes(
+            Server("passive-stream"), stateless_instance=False, session_idle_timeout=0.15,
+        )
+        headers = {"Accept": "application/json, text/event-stream"}
+        initialize = {
+            "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "stream-test", "version": "1"},
+            },
+        }
+        with anyio.fail_after(3):
+            async with manager.run(), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=Starlette(routes=routes)),
+                base_url="http://localhost",
+            ) as client:
+                response = await client.post("/mcp", headers=headers, json=initialize)
+                session_id = response.headers["mcp-session-id"]
+
+                async def stream() -> None:
+                    await client.get("/mcp", headers={
+                        **headers, "mcp-session-id": session_id,
+                    })
+
+                async with anyio.create_task_group() as group:
+                    group.start_soon(stream)
+                    await anyio.sleep(0.04)
+                    assert session_id in manager._server_instances  # noqa: SLF001
+                    response = await client.post("/mcp", headers=headers, json=initialize)
+                    assert response.status_code == HTTPStatus.OK
+                    assert session_id not in manager._server_instances  # noqa: SLF001
+                    group.cancel_scope.cancel()
+
+    anyio.run(scenario)
+
+
 @pytest.mark.parametrize("stall_forward", [False, True])
 def test_downstream_cancel_targets_actual_upstream_request_and_releases_handler(
     monkeypatch: pytest.MonkeyPatch, stall_forward: bool,
