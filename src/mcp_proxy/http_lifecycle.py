@@ -58,7 +58,7 @@ def _identifier(value: object) -> str:
     )
 
 
-def _request_labels(body: bytes) -> tuple[str, str]:
+def _request_labels(body: bytes | bytearray) -> tuple[str, str]:
     try:
         payload = json.loads(body)
     except (UnicodeDecodeError, ValueError):
