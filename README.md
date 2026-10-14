@@ -446,3 +446,27 @@ fg
 
 # Send CTRL+C to stop the first server
 ```
+
+## Opt-in MCP HTTP lifecycle diagnostics (SanityCloud fork)
+
+Set `MCP_HTTP_LIFECYCLE_LOGGING=1` **before launching** the proxy to record a
+single `mcp_http_lifecycle` log entry when each `/mcp` HTTP exchange finishes.
+The default is off; the setting does not change transport mode, session limits,
+or tool admission. Both `/mcp` and `/mcp/` are covered.
+
+Entries include a random request ID, a sanitized `CF-Ray` value when supplied
+by the ingress (useful for matching Cloudflare edge logs but not proof of
+client identity), HTTP method/status/duration, MCP method and
+tool name (where the body was consumed), whether a disconnect was **observed**,
+and a cancellation/exception classification. Session, peer address, and user-agent
+identifiers use process-local salted fingerprints. Initialization response
+session identifiers are fingerprinted using the same salt as subsequent requests.
+Neither raw tokens nor tool arguments are written to these diagnostic records.
+
+**Interpretation:** `http_response_complete` does not prove that tool execution
+succeeded. `task_cancelled_origin_unknown` does not prove the client caused the
+cancellation. Cloudflare stream cancellations may be invisible to the ASGI
+application, so use edge request IDs/logs separately to corroborate them. Client
+fingerprints are diagnostic cohorts, not authenticated ChatGPT identities. This
+facility is suitable for bounded investigations; disable it afterward to avoid
+high-volume request logs. Enabling it requires a proxy restart.

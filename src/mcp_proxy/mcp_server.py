@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Mount, Route
 from starlette.types import Message, Receive, Scope, Send
 
+from .http_lifecycle import instrument_http_endpoint
 from .proxy_server import create_proxy_server
 
 logger = logging.getLogger(__name__)
@@ -347,17 +348,18 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                     http_session_manager._server_instances.pop(session_id, None)  # noqa: SLF001
                     last_completed.pop(session_id, None)
 
+    http_endpoint = _ASGIEndpointAdapter(instrument_http_endpoint(handle_streamable_http_instance))
     routes = [
         Route("/healthz", endpoint=_handle_healthz, methods=["GET", "HEAD"]),
         Route(
             "/mcp",
-            endpoint=_ASGIEndpointAdapter(handle_streamable_http_instance),
+            endpoint=http_endpoint,
             methods=HTTP_METHODS,
             include_in_schema=False,
         ),
         Route(
             "/mcp/",
-            endpoint=_ASGIEndpointAdapter(handle_streamable_http_instance),
+            endpoint=http_endpoint,
             methods=HTTP_METHODS,
             include_in_schema=False,
         ),
