@@ -6,7 +6,10 @@ letting structured_content.py align runtime payloads with those schemas.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mcp import types
 
 ANY_JSON_SCHEMA: dict[str, Any] = {}
 
@@ -359,7 +362,10 @@ PROMPTS_OUTPUT_SCHEMA: dict[str, Any] = {
         "text": {"type": "string"},
         "success": {"type": "boolean"},
         "prompt": {"type": ["object", "null"], "additionalProperties": True},
-        "prompts": {"type": ["array", "null"], "items": {"type": "object", "additionalProperties": True}},
+        "prompts": {
+            "type": ["array", "null"],
+            "items": {"type": "object", "additionalProperties": True},
+        },
     },
     "additionalProperties": True,
 }
@@ -554,7 +560,7 @@ def output_schema_for_tool(name: str) -> dict[str, Any] | None:
     return OUTPUT_SCHEMAS.get(base_name)
 
 
-def apply_output_schemas(list_tools_result: Any) -> Any:
+def apply_output_schemas(list_tools_result: types.ListToolsResult) -> types.ListToolsResult:
     """Ensure known proxied tools advertise the canonical outputSchema."""
     for tool in getattr(list_tools_result, "tools", []) or []:
         name = getattr(tool, "name", "")

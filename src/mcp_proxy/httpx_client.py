@@ -129,13 +129,10 @@ def custom_httpx_client(  # noqa: C901
         destination_class = str(
             request.extensions.get("sanitycloud_destination_class") or _destination_class(request)
         )
-        requests_per_minute = int(
-            request.extensions.get("sanitycloud_requests_per_minute") or 0
-        )
+        requests_per_minute = int(request.extensions.get("sanitycloud_requests_per_minute") or 0)
         retry_after = _sanitize_retry_after(response.headers.get("Retry-After"))
         logger.info(
-            "destination_class=%s request_type=%s status=%d retry_after=%s "
-            "requests_per_minute=%d",
+            "destination_class=%s request_type=%s status=%d retry_after=%s requests_per_minute=%d",
             destination_class,
             request.method,
             response.status_code,

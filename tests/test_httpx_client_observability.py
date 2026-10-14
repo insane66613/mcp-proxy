@@ -25,9 +25,7 @@ def _event_hooks(mock_async_client: Mock) -> dict[str, list[Any]]:
 
 
 def _run_hook(
-    hook: Callable[
-        [httpx.Request | httpx.Response], Coroutine[object, object, None]
-    ],
+    hook: Callable[[httpx.Request | httpx.Response], Coroutine[object, object, None]],
     value: httpx.Request | httpx.Response,
 ) -> None:
     asyncio.run(hook(value))

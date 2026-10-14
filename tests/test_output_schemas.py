@@ -11,11 +11,13 @@ from mcp_proxy.structured_content import enrich_call_tool_result
 
 
 def test_widget_only_file_tools_do_not_get_model_facing_output_schemas() -> None:
+    """File tools use widget-side previews instead of declared schemas."""
     for name in ("read_file", "write_file", "edit_block", "list_directory"):
         assert output_schema_for_tool(f"desktop-commander_{name}") is None
 
 
 def test_apply_output_schemas_overwrites_existing_schema() -> None:
+    """Managed tools receive the canonical output schema."""
     weak = {"type": "object", "properties": {"text": {"type": "string"}}}
     tools = types.ListToolsResult(
         tools=[
@@ -33,21 +35,26 @@ def test_apply_output_schemas_overwrites_existing_schema() -> None:
 
 
 def test_enrich_start_process_structured_content() -> None:
+    """Validate structured process metadata."""
+    expected_pid = 4242
     result = types.CallToolResult(
         content=[
             types.TextContent(
                 type="text",
-                text="Process started with PID 4242 (shell: pwsh)\nInitial output:\nhello",
+                text=(
+                    f"Process started with PID {expected_pid} (shell: pwsh)\nInitial output:\nhello"
+                ),
             )
         ]
     )
     enrich_call_tool_result("desktop-commander_start_process", result)
     assert result.structuredContent is not None
-    assert result.structuredContent["pid"] == 4242
+    assert result.structuredContent["pid"] == expected_pid
     assert result.structuredContent["success"] is True
 
 
 def test_enrich_preserves_existing_file_preview() -> None:
+    """Explicit file metadata is normalized without losing its content."""
     result = types.CallToolResult(
         content=[types.TextContent(type="text", text="file body")],
         structuredContent={
@@ -62,12 +69,15 @@ def test_enrich_preserves_existing_file_preview() -> None:
 
 
 def test_enrich_recent_tool_calls_parses_json() -> None:
+    """Recent tool-call entries retain their JSON representation."""
     payload = [{"tool": "read_file", "timestamp": "now"}]
     result = types.CallToolResult(
         content=[
             types.TextContent(
                 type="text",
-                text=f"Tool Call History (1 results, 1 total in memory)\n\n{payload}".replace("'", '"'),
+                text=f"Tool Call History (1 results, 1 total in memory)\n\n{payload}".replace(
+                    "'", '"'
+                ),
             )
         ]
     )
