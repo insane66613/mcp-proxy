@@ -75,8 +75,13 @@ HTTP_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRA
 
 
 async def _handle_status(_: Request) -> Response:
-    """Global health check and service usage monitoring endpoint."""
+    """Global service usage monitoring endpoint."""
     return JSONResponse(_global_status)
+
+
+async def _handle_healthz(_: Request) -> Response:
+    """Transport-only liveness probe that never allocates an MCP session."""
+    return Response(status_code=204)
 
 
 def create_single_instance_routes(  # noqa: C901, PLR0915
@@ -308,6 +313,7 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                     last_completed.pop(session_id, None)
 
     routes = [
+        Route("/healthz", endpoint=_handle_healthz, methods=["GET", "HEAD"]),
         Route(
             "/mcp",
             endpoint=_ASGIEndpointAdapter(handle_streamable_http_instance),

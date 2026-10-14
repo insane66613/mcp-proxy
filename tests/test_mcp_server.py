@@ -107,6 +107,25 @@ async def test_discovery_requests_do_not_enter_session_manager(
 
 
 @pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("prefix", ["", "/servers/example"])
+async def test_healthz_probe_does_not_enter_session_manager(
+    *, stateless: bool, prefix: str,
+) -> None:
+    """Expose a transport liveness endpoint without creating MCP sessions."""
+    server: Server[object, t.Any] = Server("TestServer")
+    routes, manager = create_single_instance_routes(server, stateless_instance=stateless)
+    app = Starlette(routes=[Mount(prefix, routes=routes)] if prefix else routes)
+    app.router.redirect_slashes = False
+    with patch.object(manager, "handle_request", new_callable=AsyncMock) as handle:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for method in (client.get, client.head):
+                response = await method(prefix + "/healthz")
+                assert response.status_code == 204
+                assert response.content == b""
+        handle.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stateless", [False, True])
 @pytest.mark.parametrize("path", ["/mcp", "/mcp/"])
 @pytest.mark.parametrize("prefix", ["", "/servers/example"])
 @pytest.mark.parametrize(
