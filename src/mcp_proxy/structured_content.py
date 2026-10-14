@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mcp import types
 
 from .output_schemas import _base_tool_name
 
@@ -14,7 +17,7 @@ _TOTAL_RESULTS_RE = re.compile(r"Total results(?: found)?[:\s]+(\d+)", re.IGNORE
 _SUCCESSFULLY_RE = re.compile(r"^Successfully\s+(.+)$", re.IGNORECASE | re.MULTILINE)
 
 
-def _text_from_content(content: Any) -> str:
+def _text_from_content(content: list[types.Content] | None) -> str:
     if not content:
         return ""
     parts: list[str] = []
@@ -145,8 +148,8 @@ def _list_sessions_fields(text: str) -> dict[str, Any]:
     if "No active sessions" in text:
         return {"sessions": [], "text": text, "count": 0}
     sessions: list[dict[str, Any]] = []
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line.startswith("PID:"):
             continue
         pid_match = re.search(r"PID:\s*(-?\d+)", line)
@@ -189,7 +192,9 @@ def _normalize_file_preview(structured: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _build_structured_content(base_name: str, text: str, *, is_error: bool) -> dict[str, Any] | None:
+def _build_structured_content(  # noqa: C901, PLR0911, PLR0912
+    base_name: str, text: str, *, is_error: bool
+) -> dict[str, Any] | None:
     if base_name in {
         "create_directory",
         "move_file",
@@ -255,7 +260,7 @@ def _build_structured_content(base_name: str, text: str, *, is_error: bool) -> d
     return None
 
 
-def enrich_call_tool_result(tool_name: str, result: Any) -> Any:
+def enrich_call_tool_result(tool_name: str, result: types.CallToolResult) -> types.CallToolResult:
     """Attach or normalize structuredContent so it aligns with advertised outputSchema."""
     existing = getattr(result, "structuredContent", None)
     if isinstance(existing, dict):

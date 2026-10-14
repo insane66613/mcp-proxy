@@ -26,27 +26,26 @@ def test_expected_standalone_sse_closed_resource_error_is_suppressed() -> None:
     """Expected standalone-SSE teardown noise is filtered."""
     filter_ = _ExpectedStandaloneSseTeardownFilter()
 
-    assert filter_.filter(
-        _record("Error in standalone SSE writer", anyio.ClosedResourceError())
-    ) is False
+    assert (
+        filter_.filter(_record("Error in standalone SSE writer", anyio.ClosedResourceError()))
+        is False
+    )
 
 
 def test_unexpected_standalone_sse_error_remains_visible() -> None:
     """Unexpected exceptions on the same code path stay visible."""
     filter_ = _ExpectedStandaloneSseTeardownFilter()
 
-    assert filter_.filter(
-        _record("Error in standalone SSE writer", RuntimeError("boom"))
-    ) is True
+    assert filter_.filter(_record("Error in standalone SSE writer", RuntimeError("boom"))) is True
 
 
 def test_closed_resource_error_on_other_message_remains_visible() -> None:
     """ClosedResourceError elsewhere is not hidden."""
     filter_ = _ExpectedStandaloneSseTeardownFilter()
 
-    assert filter_.filter(
-        _record("Error handling POST request", anyio.ClosedResourceError())
-    ) is True
+    assert (
+        filter_.filter(_record("Error handling POST request", anyio.ClosedResourceError())) is True
+    )
 
 
 def test_setup_logging_installs_filter_once() -> None:

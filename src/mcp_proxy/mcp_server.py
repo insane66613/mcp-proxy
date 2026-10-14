@@ -22,7 +22,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Mount, Route
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 
 from .proxy_server import create_proxy_server
 
@@ -53,6 +53,7 @@ class MCPServerSettings:
 # To store last activity for multiple servers if needed, though status endpoint is global for now.
 _global_status: dict[str, Any] = {
     "api_last_activity": datetime.now(timezone.utc).isoformat(),
+    "active_sse_connections": 0,
     "server_instances": {},  # Could be used to store per-instance status later
 }
 
@@ -128,22 +129,37 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
         return True
 
     async def handle_sse_instance(request: Request) -> Response:
-        async with sse_transport.connect_sse(
-            request.scope,
-            request.receive,
-            request._send,  # noqa: SLF001
-        ) as (read_stream, write_stream):
-            _update_global_activity()
-            await mcp_server_instance.run(
-                read_stream,
-                write_stream,
-                mcp_server_instance.create_initialization_options(),
-                stateless=stateless_instance,
+        try:
+            async with sse_transport.connect_sse(
+                request.scope,
+                request.receive,
+                request._send,  # noqa: SLF001
+            ) as (read_stream, write_stream):
+                _update_global_activity()
+                _global_status["active_sse_connections"] += 1
+                try:
+                    await mcp_server_instance.run(
+                        read_stream,
+                        write_stream,
+                        mcp_server_instance.create_initialization_options(),
+                        stateless=stateless_instance,
+                    )
+                finally:
+                    _global_status["active_sse_connections"] -= 1
+        except Exception:  # noqa: BLE001
+            # SSE response already started — cannot send HTTP error response.
+            # Log and let the connection close gracefully.
+            logger.warning(
+                "SSE connection for '%s' terminated with error (upstream disconnect?)",
+                mcp_server_instance.name,
+                exc_info=True,
             )
         return Response()
 
     async def handle_streamable_http_instance(  # noqa: C901, PLR0912, PLR0915
-        scope: Scope, receive: Receive, send: Send,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
     ) -> None:
         if scope.get("type") == "http":
             request = Request(scope)
@@ -198,14 +214,18 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
             request = Request(scope, receive)
             if request.method != "POST":
                 await Response("MCP session ID required", status_code=400)(
-                    updated_scope, receive, send,
+                    updated_scope,
+                    receive,
+                    send,
                 )
                 return
             body = bytearray()
             async for chunk in request.stream():
                 if len(body) + len(chunk) > 4 * 1024 * 1024:
                     await Response("Initialization body too large", status_code=413)(
-                        updated_scope, receive, send,
+                        updated_scope,
+                        receive,
+                        send,
                     )
                     return
                 body.extend(chunk)
@@ -215,13 +235,15 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                 message = None
             if not isinstance(message, dict) or message.get("method") != "initialize":
                 await Response("Initialize a session first", status_code=400)(
-                    updated_scope, receive, send,
+                    updated_scope,
+                    receive,
+                    send,
                 )
                 return
 
             body_sent = False
 
-            async def replay_receive() -> dict[str, Any]:
+            async def replay_receive() -> Message:
                 nonlocal body_sent
                 if body_sent:
                     return await receive()
@@ -235,7 +257,8 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                     last_completed.pop(stale_id, None)
                 if len(http_session_manager._server_instances) >= MAX_HTTP_SESSIONS:  # noqa: SLF001
                     candidates = [
-                        key for key in instances
+                        key
+                        for key in instances
                         if not active_requests.get(key, 0)
                         and anyio.current_time() - last_completed.get(key, anyio.current_time())
                         >= SESSION_PRESSURE_GRACE_SECONDS
@@ -247,17 +270,19 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                 if len(instances) >= MAX_HTTP_SESSIONS:
                     logger.warning(
                         "MCP session capacity reached: sessions=%s active=%s",
-                        len(instances), sum(bool(active_requests.get(key, 0)) for key in instances),
+                        len(instances),
+                        sum(bool(active_requests.get(key, 0)) for key in instances),
                     )
                     await Response(
-                        "MCP session capacity reached", status_code=429,
+                        "MCP session capacity reached",
+                        status_code=429,
                         headers={"Retry-After": "30"},
                     )(updated_scope, receive, send)
                     return
                 previous_ids = set(instances)
                 response_status = 500
 
-                async def capture_send(message: dict[str, Any]) -> None:
+                async def capture_send(message: Message) -> None:
                     nonlocal response_status
                     if message["type"] == "http.response.start":
                         response_status = message["status"]
@@ -265,7 +290,9 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
 
                 try:
                     await http_session_manager.handle_request(
-                        updated_scope, replay_receive, capture_send,
+                        updated_scope,
+                        replay_receive,
+                        capture_send,
                     )
                 finally:
                     for new_id in set(instances) - previous_ids:
@@ -273,16 +300,22 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                         if response_status >= HTTPStatus.BAD_REQUEST:
                             await retire_session(new_id)
         else:
-            transport = http_session_manager._server_instances.get(session_id)  # noqa: SLF001
+            transport = (
+                http_session_manager._server_instances.get(session_id)  # noqa: SLF001
+                if session_id is not None
+                else None
+            )
             active = Request(scope).method != "GET"
             if active and transport is not None and session_id is not None:
                 active_requests[session_id] = active_requests.get(session_id, 0) + 1
                 if transport.idle_scope is not None:
                     transport.idle_scope.deadline = float("inf")
             elif (
-                transport is not None and session_id is not None
+                transport is not None
+                and session_id is not None
                 and transport.idle_scope is not None
-                and session_idle_timeout is not None and not active_requests.get(session_id, 0)
+                and session_idle_timeout is not None
+                and not active_requests.get(session_id, 0)
             ):
                 # A passive event stream refreshes arrival time but cannot pin a session.
                 transport.idle_scope.deadline = anyio.current_time() + session_idle_timeout
@@ -306,7 +339,9 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                             )
                 # SDK v1 retains explicitly terminated transports after DELETE.
                 if (
-                    transport is not None and transport.is_terminated
+                    transport is not None
+                    and transport.is_terminated
+                    and session_id is not None
                     and http_session_manager._server_instances.get(session_id) is transport  # noqa: SLF001
                 ):
                     http_session_manager._server_instances.pop(session_id, None)  # noqa: SLF001

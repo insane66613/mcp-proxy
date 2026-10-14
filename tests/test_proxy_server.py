@@ -22,6 +22,7 @@ from mcp.shared.exceptions import McpError
 from mcp.shared.memory import create_connected_server_and_client_session
 from pydantic import AnyUrl
 
+from mcp_proxy.output_schemas import OUTPUT_SCHEMAS
 from mcp_proxy.proxy_server import create_proxy_server
 
 TOOL_INPUT_SCHEMA = {"type": "object", "properties": {"input1": {"type": "string"}}}
@@ -63,6 +64,17 @@ def session_generator(request: pytest.FixtureRequest) -> SessionContextManager:
 def server() -> Server[object]:
     """Return a server instance."""
     return Server("test-server")
+
+
+async def test_proxy_preserves_server_version() -> None:
+    """Test that initialization reports the upstream server version."""
+    server: Server[object] = Server("versioned-server", version="2.4.1")
+
+    async with proxy(server) as session:
+        result = await session.initialize()
+
+    assert result.serverInfo.name == "versioned-server"
+    assert result.serverInfo.version == "2.4.1"
 
 
 @pytest.fixture
@@ -197,7 +209,11 @@ def server_can_send_progress_notification(
 def server_can_complete(
     server: Server[object],
     complete_callback: Callable[
-        [types.PromptReference | types.ResourceReference, types.CompletionArgument],
+        [
+            types.PromptReference | types.ResourceTemplateReference,
+            types.CompletionArgument,
+            types.CompletionContext | None,
+        ],
         Awaitable[types.Completion | None],
     ],
 ) -> Server[object]:
@@ -205,11 +221,11 @@ def server_can_complete(
 
     @server.completion()  # type: ignore[no-untyped-call,misc]
     async def _completion(
-        reference: types.PromptReference | types.ResourceReference,
+        reference: types.PromptReference | types.ResourceTemplateReference,
         argument: types.CompletionArgument,
-        _context: object | None = None,
+        context: types.CompletionContext | None = None,
     ) -> types.Completion | None:
-        return await complete_callback(reference, argument)
+        return await complete_callback(reference, argument, context)
 
     return server
 
@@ -265,6 +281,40 @@ async def test_list_tools(
 
         with pytest.raises(McpError, match="Method not found"):
             await session.list_prompts()
+
+
+async def test_list_tools_pagination_preserves_custom_schemas() -> None:
+    """Preserve cursor forwarding and the fork's output-schema enrichment."""
+    upstream: Server[object] = Server("paged-tools")
+    seen_cursors: list[str | None] = []
+
+    @upstream.list_tools()  # type: ignore[no-untyped-call,misc]
+    async def advertise_tools() -> list[types.Tool]:
+        return []
+
+    async def list_page(req: types.ListToolsRequest) -> types.ServerResult:
+        cursor = req.params.cursor if req.params else None
+        seen_cursors.append(cursor)
+        tool = types.Tool(
+            name="desktop-commander_start_process",
+            inputSchema={"type": "object"},
+        )
+        page = types.ListToolsResult(
+            tools=[tool],
+            nextCursor="page-2" if cursor is None else None,
+        )
+        return types.ServerResult(page)
+
+    upstream.request_handlers[types.ListToolsRequest] = list_page
+
+    async with proxy(upstream) as session:
+        first = await session.list_tools()
+        second = await session.list_tools(params=types.PaginatedRequestParams(cursor="page-2"))
+
+    assert seen_cursors == [None, "page-2"]
+    assert first.nextCursor == "page-2"
+    assert first.tools[0].outputSchema == OUTPUT_SCHEMAS["start_process"]
+    assert second.nextCursor is None
 
 
 @pytest.mark.parametrize("logging_level_callback", [AsyncMock()])
@@ -499,10 +549,20 @@ async def test_send_progress_notification(
 
 
 @pytest.mark.parametrize("complete_callback", [AsyncMock()])
+@pytest.mark.parametrize("context_arguments", [None, {}, {"owner": "example"}])
+@pytest.mark.parametrize(
+    "reference",
+    [
+        types.PromptReference(type="ref/prompt", name="name"),
+        types.ResourceTemplateReference(type="ref/resource", uri="repo://{owner}/{name}"),
+    ],
+)
 async def test_complete(
     session_generator: SessionContextManager,
     server_can_complete: Server[object],
     complete_callback: AsyncMock,
+    context_arguments: dict[str, str] | None,
+    reference: types.PromptReference | types.ResourceTemplateReference,
 ) -> None:
     """Test complete."""
     async with session_generator(server_can_complete) as session:
@@ -510,15 +570,19 @@ async def test_complete(
 
         complete_callback.return_value = None
         result = await session.complete(
-            types.PromptReference(type="ref/prompt", name="name"),
+            reference,
             argument={"name": "name", "value": "value"},
+            context_arguments=context_arguments,
         )
 
         assert result.completion.values == []
 
         complete_callback.assert_called_with(
-            types.PromptReference(type="ref/prompt", name="name"),
+            reference,
             types.CompletionArgument(name="name", value="value"),
+            types.CompletionContext(arguments=context_arguments)
+            if context_arguments is not None
+            else None,
         )
         complete_callback.reset_mock()
 

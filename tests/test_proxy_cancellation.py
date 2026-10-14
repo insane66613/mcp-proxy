@@ -39,32 +39,52 @@ def test_pressure_reclaims_idle_sessions_but_preserves_active_calls(
             return [types.TextContent(type="text", text="finished")]
 
         routes, manager = create_single_instance_routes(
-            server, stateless_instance=False, session_idle_timeout=0.15,
+            server,
+            stateless_instance=False,
+            session_idle_timeout=0.15,
         )
         headers = {"Accept": "application/json, text/event-stream"}
         initialize = {
-            "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-                "protocolVersion": "2025-11-25", "capabilities": {},
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
                 "clientInfo": {"name": "pressure-test", "version": "1"},
             },
         }
         with anyio.fail_after(3):
-            async with manager.run(), httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=Starlette(routes=routes)),
-                base_url="http://localhost",
-            ) as client:
+            async with (
+                manager.run(),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=Starlette(routes=routes)),
+                    base_url="http://localhost",
+                ) as client,
+            ):
                 first = await client.post("/mcp", headers=headers, json=initialize)
                 active_id = first.headers["mcp-session-id"]
                 active_headers = {**headers, "mcp-session-id": active_id}
-                await client.post("/mcp", headers=active_headers, json={
-                    "jsonrpc": "2.0", "method": "notifications/initialized",
-                })
+                await client.post(
+                    "/mcp",
+                    headers=active_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                    },
+                )
 
                 async def invoke() -> None:
-                    result = await client.post("/mcp", headers=active_headers, json={
-                        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-                        "params": {"name": "hang", "arguments": {}},
-                    })
+                    result = await client.post(
+                        "/mcp",
+                        headers=active_headers,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 7,
+                            "method": "tools/call",
+                            "params": {"name": "hang", "arguments": {}},
+                        },
+                    )
                     assert result.json()["result"]["content"][0]["text"] == "finished"
 
                 async with anyio.create_task_group() as group:
@@ -103,10 +123,13 @@ def test_invalid_headerless_requests_do_not_retain_sessions() -> None:
         routes, manager = create_single_instance_routes(Server("invalid"), stateless_instance=False)
         headers = {"Accept": "application/json, text/event-stream"}
         with anyio.fail_after(3):
-            async with manager.run(), httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=Starlette(routes=routes)),
-                base_url="http://localhost",
-            ) as client:
+            async with (
+                manager.run(),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=Starlette(routes=routes)),
+                    base_url="http://localhost",
+                ) as client,
+            ):
                 response = await client.get("/mcp", headers=headers)
                 assert response.status_code == HTTPStatus.BAD_REQUEST
                 for body in (b"invalid-json", b'{"method":"ping"}', b'{"method":"initialize"}'):
@@ -114,7 +137,9 @@ def test_invalid_headerless_requests_do_not_retain_sessions() -> None:
                     assert response.status_code == HTTPStatus.BAD_REQUEST
                     assert not manager._server_instances  # noqa: SLF001
                 response = await client.post(
-                    "/mcp", headers=headers, content=b" " * (4 * 1024 * 1024 + 1),
+                    "/mcp",
+                    headers=headers,
+                    content=b" " * (4 * 1024 * 1024 + 1),
                 )
                 assert response.status_code == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
                 assert not manager._server_instances  # noqa: SLF001
@@ -131,27 +156,40 @@ def test_passive_sse_connection_does_not_pin_an_idle_session(
 
     async def scenario() -> None:
         routes, manager = create_single_instance_routes(
-            Server("passive-stream"), stateless_instance=False, session_idle_timeout=0.15,
+            Server("passive-stream"),
+            stateless_instance=False,
+            session_idle_timeout=0.15,
         )
         headers = {"Accept": "application/json, text/event-stream"}
         initialize = {
-            "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-                "protocolVersion": "2025-11-25", "capabilities": {},
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
                 "clientInfo": {"name": "stream-test", "version": "1"},
             },
         }
         with anyio.fail_after(3):
-            async with manager.run(), httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=Starlette(routes=routes)),
-                base_url="http://localhost",
-            ) as client:
+            async with (
+                manager.run(),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=Starlette(routes=routes)),
+                    base_url="http://localhost",
+                ) as client,
+            ):
                 response = await client.post("/mcp", headers=headers, json=initialize)
                 session_id = response.headers["mcp-session-id"]
 
                 async def stream() -> None:
-                    await client.get("/mcp", headers={
-                        **headers, "mcp-session-id": session_id,
-                    })
+                    await client.get(
+                        "/mcp",
+                        headers={
+                            **headers,
+                            "mcp-session-id": session_id,
+                        },
+                    )
 
                 async with anyio.create_task_group() as group:
                     group.start_soon(stream)
@@ -167,7 +205,8 @@ def test_passive_sse_connection_does_not_pin_an_idle_session(
 
 @pytest.mark.parametrize("stall_forward", [False, True])
 def test_downstream_cancel_targets_actual_upstream_request_and_releases_handler(
-    monkeypatch: pytest.MonkeyPatch, stall_forward: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    stall_forward: bool,
 ) -> None:
     """Use two real SDK sessions and protocol notifications, without replaying work."""
 
@@ -200,7 +239,9 @@ def test_downstream_cancel_targets_actual_upstream_request_and_releases_handler(
                     downstream_id = downstream._request_id  # noqa: SLF001
                     if stall_forward:
                         monkeypatch.setattr(
-                            proxy_server, "CANCELLATION_FORWARD_TIMEOUT_SECONDS", 0.03,
+                            proxy_server,
+                            "CANCELLATION_FORWARD_TIMEOUT_SECONDS",
+                            0.03,
                         )
 
                         async def stalled_notification(
@@ -224,7 +265,9 @@ def test_downstream_cancel_targets_actual_upstream_request_and_releases_handler(
                         await downstream.send_notification(
                             types.ClientNotification(
                                 types.CancelledNotification(
-                                    params=types.CancelledNotificationParams(requestId=downstream_id),
+                                    params=types.CancelledNotificationParams(
+                                        requestId=downstream_id
+                                    ),
                                 ),
                             ),
                         )
@@ -249,25 +292,39 @@ def test_concurrent_session_creation_is_bounded_and_delete_frees_capacity(
 
     async def scenario() -> None:
         routes, manager = create_single_instance_routes(
-            Server("capacity"), stateless_instance=False,
+            Server("capacity"),
+            stateless_instance=False,
         )
         app = Starlette(routes=routes)
         responses = []
         headers = {"Accept": "application/json, text/event-stream"}
         initialize_request = {
-            "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-                "protocolVersion": "2025-11-25", "capabilities": {},
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
                 "clientInfo": {"name": "capacity-test", "version": "1"},
             },
         }
         with anyio.fail_after(3):
-            async with manager.run(), httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://localhost",
-            ) as client:
+            async with (
+                manager.run(),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://localhost",
+                ) as client,
+            ):
+
                 async def initialize() -> None:
-                    responses.append(await client.post(
-                        "/mcp", headers=headers, json=initialize_request,
-                    ))
+                    responses.append(
+                        await client.post(
+                            "/mcp",
+                            headers=headers,
+                            json=initialize_request,
+                        )
+                    )
 
                 async with anyio.create_task_group() as group:
                     for _ in range(capacity * 2):
@@ -281,24 +338,46 @@ def test_concurrent_session_creation_is_bounded_and_delete_frees_capacity(
                     r.headers["mcp-session-id"] for r in responses if r.status_code == HTTPStatus.OK
                 ]
                 known_headers = {**headers, "mcp-session-id": session_ids[0]}
-                response = await client.post("/mcp", headers=known_headers, json={
-                    "jsonrpc": "2.0", "method": "notifications/initialized",
-                })
+                response = await client.post(
+                    "/mcp",
+                    headers=known_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                    },
+                )
                 assert response.status_code == HTTPStatus.ACCEPTED
-                response = await client.post("/mcp", headers=known_headers, json={
-                    "jsonrpc": "2.0", "id": 1, "method": "ping",
-                })
+                response = await client.post(
+                    "/mcp",
+                    headers=known_headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "ping",
+                    },
+                )
                 assert response.status_code == HTTPStatus.OK
-                response = await client.post("/mcp", headers={
-                    **headers, "mcp-session-id": "unknown",
-                }, json={
-                    "jsonrpc": "2.0", "id": 1, "method": "ping",
-                })
+                response = await client.post(
+                    "/mcp",
+                    headers={
+                        **headers,
+                        "mcp-session-id": "unknown",
+                    },
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "ping",
+                    },
+                )
                 assert response.status_code == HTTPStatus.NOT_FOUND
                 for session_id in session_ids:
-                    response = await client.delete("/mcp", headers={
-                        **headers, "mcp-session-id": session_id,
-                    })
+                    response = await client.delete(
+                        "/mcp",
+                        headers={
+                            **headers,
+                            "mcp-session-id": session_id,
+                        },
+                    )
                     assert response.status_code == HTTPStatus.OK
                 assert not manager._server_instances  # noqa: SLF001
                 await initialize()
@@ -334,12 +413,20 @@ def test_http_cancellation_requires_shared_stateful_session(stateless: bool) -> 
         app = Starlette(routes=routes)
         headers = {"Accept": "application/json, text/event-stream"}
         with anyio.fail_after(3):
-            async with manager.run(), httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://localhost",
-            ) as client:
+            async with (
+                manager.run(),
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://localhost",
+                ) as client,
+            ):
                 initialize_request = {
-                    "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
-                        "protocolVersion": "2025-11-25", "capabilities": {},
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
                         "clientInfo": {"name": "cancellation-test", "version": "1"},
                     },
                 }
@@ -350,25 +437,41 @@ def test_http_cancellation_requires_shared_stateful_session(stateless: bool) -> 
                 if session_id:
                     headers["mcp-session-id"] = session_id
                 headers["mcp-protocol-version"] = response.json()["result"]["protocolVersion"]
-                response = await client.post("/mcp", headers=headers, json={
-                    "jsonrpc": "2.0", "method": "notifications/initialized",
-                })
+                response = await client.post(
+                    "/mcp",
+                    headers=headers,
+                    json={
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                    },
+                )
                 assert response.status_code == HTTPStatus.ACCEPTED
 
                 async def invoke() -> None:
-                    response = await client.post("/mcp", headers=headers, json={
-                        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
-                        "params": {"name": "hang", "arguments": {}},
-                    })
+                    response = await client.post(
+                        "/mcp",
+                        headers=headers,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 7,
+                            "method": "tools/call",
+                            "params": {"name": "hang", "arguments": {}},
+                        },
+                    )
                     assert response.status_code == HTTPStatus.OK
 
                 async with anyio.create_task_group() as group:
                     group.start_soon(invoke)
                     await entered.wait()
-                    response = await client.post("/mcp", headers=headers, json={
-                        "jsonrpc": "2.0", "method": "notifications/cancelled",
-                        "params": {"requestId": 7},
-                    })
+                    response = await client.post(
+                        "/mcp",
+                        headers=headers,
+                        json={
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": {"requestId": 7},
+                        },
+                    )
                     assert response.status_code == HTTPStatus.ACCEPTED
                     with anyio.move_on_after(0.1) as deadline:
                         await ended.wait()

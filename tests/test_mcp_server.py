@@ -109,7 +109,9 @@ async def test_discovery_requests_do_not_enter_session_manager(
 @pytest.mark.parametrize("stateless", [False, True])
 @pytest.mark.parametrize("prefix", ["", "/servers/example"])
 async def test_healthz_probe_does_not_enter_session_manager(
-    *, stateless: bool, prefix: str,
+    *,
+    stateless: bool,
+    prefix: str,
 ) -> None:
     """Expose a transport liveness endpoint without creating MCP sessions."""
     server: Server[object, t.Any] = Server("TestServer")
