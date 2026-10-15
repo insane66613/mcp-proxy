@@ -1,5 +1,7 @@
 """Tests for Desktop Commander output schema enrichment."""
 
+import jsonschema
+import pytest
 from mcp import types
 
 from mcp_proxy.output_schemas import (
@@ -10,10 +12,60 @@ from mcp_proxy.output_schemas import (
 from mcp_proxy.structured_content import enrich_call_tool_result
 
 
-def test_widget_only_file_tools_do_not_get_model_facing_output_schemas() -> None:
-    """File tools use widget-side previews instead of declared schemas."""
+def test_file_tools_advertise_lean_model_and_optional_widget_output_schemas() -> None:
+    """File schemas require a result flag while allowing optional rich preview metadata."""
     for name in ("read_file", "write_file", "edit_block", "list_directory"):
-        assert output_schema_for_tool(f"desktop-commander_{name}") is None
+        schema = output_schema_for_tool(f"desktop-commander_{name}")
+        assert schema is not None
+        assert schema["required"] == ["success"]
+        jsonschema.Draft202012Validator.check_schema(schema)
+        tools = types.ListToolsResult(tools=[types.Tool(name=name, inputSchema={"type": "object"})])
+        apply_output_schemas(tools)
+        assert tools.tools[0].outputSchema == schema
+
+
+@pytest.mark.parametrize("name", ["read_file", "write_file", "edit_block", "list_directory"])
+@pytest.mark.parametrize("kind", ["text", "image", "empty"])
+@pytest.mark.parametrize("is_error", [False, True])
+def test_file_results_do_not_duplicate_payloads(name: str, kind: str, is_error: bool) -> None:
+    """Plain/image/empty model results validate without copying their potentially large content."""
+    content: list[types.Content] = []
+    if kind == "text":
+        content = [types.TextContent(type="text", text="large body\n" * 100)]
+    elif kind == "image":
+        content = [types.ImageContent(type="image", data="AA==", mimeType="image/png")]
+    result = types.CallToolResult(content=content, isError=is_error)
+    original = result.model_dump()
+    enrich_call_tool_result(f"desktop-commander_{name}", result)
+    assert result.structuredContent == {"success": not is_error}
+    assert result.model_dump()["content"] == original["content"]
+    assert result.isError == is_error
+    jsonschema.validate(result.structuredContent, output_schema_for_tool(name))
+
+
+@pytest.mark.parametrize("name", ["read_file", "write_file", "edit_block", "list_directory"])
+@pytest.mark.parametrize("is_error", [False, True])
+def test_file_widget_metadata_is_preserved(name: str, is_error: bool) -> None:
+    """Rich UI results retain their metadata, aliases and accurate failure flag."""
+    existing = {
+        "filePath": "X:\\demo.png",
+        "fileName": "demo.png",
+        "fileType": "image",
+        "imageData": "AA==",
+        "mimeType": "image/png",
+        "content": "widget preview",
+        "success": is_error,
+    }
+    result = types.CallToolResult(content=[], structuredContent=existing, isError=is_error)
+    enrich_call_tool_result(name, result)
+    assert result.structuredContent == {
+        **existing,
+        "path": existing["filePath"],
+        "name": existing["fileName"],
+        "success": not is_error,
+    }
+    jsonschema.validate(result.structuredContent, output_schema_for_tool(name))
+    assert existing["success"] == is_error
 
 
 def test_apply_output_schemas_overwrites_existing_schema() -> None:

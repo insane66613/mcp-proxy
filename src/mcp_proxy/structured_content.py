@@ -263,15 +263,15 @@ def _build_structured_content(  # noqa: C901, PLR0911, PLR0912
 def enrich_call_tool_result(tool_name: str, result: types.CallToolResult) -> types.CallToolResult:
     """Attach or normalize structuredContent so it aligns with advertised outputSchema."""
     existing = getattr(result, "structuredContent", None)
+    base_name = _base_tool_name(tool_name)
+    if base_name in {"read_file", "write_file", "edit_block", "list_directory"}:
+        # Keep file/image payloads in content once; only explicit widget metadata is retained.
+        preview = _normalize_file_preview(existing) if isinstance(existing, dict) else {}
+        preview["success"] = not bool(result.isError)
+        result.structuredContent = preview
+        return result
     if isinstance(existing, dict):
-        base_name = _base_tool_name(tool_name)
-        if base_name in {
-            "read_file",
-            "write_file",
-            "edit_block",
-            "list_directory",
-            "get_config",
-        }:
+        if base_name == "get_config":
             result.structuredContent = _normalize_file_preview(existing)
         return result
 
@@ -279,7 +279,6 @@ def enrich_call_tool_result(tool_name: str, result: types.CallToolResult) -> typ
     if not text:
         return result
 
-    base_name = _base_tool_name(tool_name)
     structured = _build_structured_content(
         base_name,
         text,

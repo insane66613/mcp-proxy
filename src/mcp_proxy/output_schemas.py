@@ -92,7 +92,14 @@ FILE_PREVIEW_PROPERTIES: dict[str, Any] = {
 
 FILE_PREVIEW_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": FILE_PREVIEW_PROPERTIES,
+    "required": ["success"],
+    "properties": {
+        **FILE_PREVIEW_PROPERTIES,
+        "success": {"type": "boolean"},
+        "text": {"type": "string"},
+        "message": {"type": "string"},
+        "error": {"type": "string"},
+    },
     "additionalProperties": True,
 }
 
@@ -494,6 +501,10 @@ JULES_GENERIC_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "read_file": FILE_PREVIEW_OUTPUT_SCHEMA,
+    "write_file": FILE_PREVIEW_OUTPUT_SCHEMA,
+    "edit_block": FILE_PREVIEW_OUTPUT_SCHEMA,
+    "list_directory": FILE_PREVIEW_OUTPUT_SCHEMA,
     "get_config": GET_CONFIG_OUTPUT_SCHEMA,
     "set_config_value": SET_CONFIG_OUTPUT_SCHEMA,
     "read_multiple_files": READ_MULTIPLE_FILES_OUTPUT_SCHEMA,
