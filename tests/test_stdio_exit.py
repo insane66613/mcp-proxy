@@ -76,8 +76,16 @@ async def proxy_process(tmp_path: Path, mode: str) -> Any:  # noqa: ANN401
     env = dict(os.environ)
     env["PYTHONPATH"] = SOURCE_ROOT
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", DRIVER, str(port), str(child), str(marker), mode,
-        env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        sys.executable,
+        "-c",
+        DRIVER,
+        str(port),
+        str(child),
+        str(marker),
+        mode,
+        env=env,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
     try:
         yield process, marker, f"http://127.0.0.1:{port}"
@@ -105,26 +113,43 @@ HEADERS = {"Accept": "application/json, text/event-stream"}
 
 async def initialize(client: httpx.AsyncClient, url: str) -> dict[str, str]:
     """Open one real stateful MCP session for lifecycle and metadata checks."""
-    response = await client.post(url, headers=HEADERS, json={
-        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-03-26", "capabilities": {},
-            "clientInfo": {"name": "exit-regression", "version": "1"},
+    response = await client.post(
+        url,
+        headers=HEADERS,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "exit-regression", "version": "1"},
+            },
         },
-    })
+    )
     response.raise_for_status()
     headers = {**HEADERS, "mcp-session-id": response.headers["mcp-session-id"]}
-    await client.post(url, headers=headers, json={
-        "jsonrpc": "2.0", "method": "notifications/initialized",
-    })
+    await client.post(
+        url,
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        },
+    )
     return headers
 
 
 @pytest.mark.parametrize("mode", ["startup", "idle", "active", "openstream", "sse", "named"])
 async def test_real_child_loss_exits_proxy(tmp_path: Path, mode: str) -> None:
     """EOF fails the whole proxy, including active/open HTTP and named backends."""
-    async with proxy_process(tmp_path, mode) as (process, marker, base), httpx.AsyncClient(
-        trust_env=False, timeout=10,
-    ) as client:
+    async with (
+        proxy_process(tmp_path, mode) as (process, marker, base),
+        httpx.AsyncClient(
+            trust_env=False,
+            timeout=10,
+        ) as client,
+    ):
         pending = None
         writer = None
         stream = None
@@ -133,10 +158,18 @@ async def test_real_child_loss_exits_proxy(tmp_path: Path, mode: str) -> None:
             await ready(client, base + route)
             headers = await initialize(client, base + route + "/mcp")
             if mode == "active":
-                pending = asyncio.create_task(client.post(base + "/mcp", headers=headers, json={
-                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                    "params": {"name": "wait", "arguments": {}},
-                }))
+                pending = asyncio.create_task(
+                    client.post(
+                        base + "/mcp",
+                        headers=headers,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "wait", "arguments": {}},
+                        },
+                    )
+                )
                 with anyio.fail_after(5):
                     while not marker.with_suffix(".active").exists():  # noqa: ASYNC110
                         await asyncio.sleep(0.01)
@@ -173,17 +206,27 @@ async def test_real_child_loss_exits_proxy(tmp_path: Path, mode: str) -> None:
 
 async def test_request_meta_survives_real_proxy(tmp_path: Path) -> None:
     """The existing metadata forwarding carries request identity and retry attempt."""
-    async with proxy_process(tmp_path, "idle") as (_, _, base), httpx.AsyncClient(
-        trust_env=False, timeout=5,
-    ) as client:
+    async with (
+        proxy_process(tmp_path, "idle") as (_, _, base),
+        httpx.AsyncClient(
+            trust_env=False,
+            timeout=5,
+        ) as client,
+    ):
         await ready(client, base)
         headers = await initialize(client, base + "/mcp")
         for attempt in (0, 1):
             meta = {"sanitycloud_request_id": "a" * 32, "sanitycloud_attempt": attempt}
-            response = await client.post(base + "/mcp", headers=headers, json={
-                "jsonrpc": "2.0", "id": 2 + attempt, "method": "tools/call",
-                "params": {"name": "wait", "arguments": {}, "_meta": meta},
-            })
+            response = await client.post(
+                base + "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2 + attempt,
+                    "method": "tools/call",
+                    "params": {"name": "wait", "arguments": {}, "_meta": meta},
+                },
+            )
             assert json.loads(response.json()["result"]["content"][0]["text"]) == meta
 
 
@@ -198,7 +241,8 @@ async def test_normal_shutdown_and_cancellation_do_not_report_child_loss() -> No
     assert not watch.exited
     assert server.should_exit
     params = StdioServerParameters(
-        command=sys.executable, args=["-c", "import time; time.sleep(60)"],
+        command=sys.executable,
+        args=["-c", "import time; time.sleep(60)"],
     )
     task = asyncio.create_task(_cancel_watch(watch, params))
     await asyncio.sleep(0.2)
