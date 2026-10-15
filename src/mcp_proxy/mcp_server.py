@@ -369,6 +369,57 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
     return routes, http_session_manager
 
 
+class _StdioExitWatch:
+    """Adapted from 0xdhx's upstream PR #248 (ad058cb): fail when a child loses stdout."""
+
+    def __init__(self) -> None:
+        self.http_server: uvicorn.Server | None = None
+        self.exited: list[str] = []
+
+    @contextlib.asynccontextmanager
+    async def client(
+        self, params: StdioServerParameters, name: str
+    ) -> AsyncIterator[tuple[Any, Any]]:
+        """Forward stdio with zero buffering so EOF also stops an idle HTTP proxy."""
+        async with stdio_client(params) as (read_stream, write_stream):
+            send, receive = anyio.create_memory_object_stream[Any](0)
+
+            async def forward() -> None:
+                async with send:
+                    try:
+                        async for message in read_stream:
+                            await send.send(message)
+                    except anyio.BrokenResourceError:
+                        return  # The session stopped reading during shutdown.
+                self._on_exit(name)
+
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(forward)
+                yield receive, write_stream
+                task_group.cancel_scope.cancel()
+
+    def _on_exit(self, name: str) -> None:
+        if self.http_server is not None and self.http_server.should_exit:
+            return
+        logger.error("Stdio server '%s' exited, shutting down", name)
+        self.exited.append(name)
+        if self.http_server is not None:
+            self.http_server.config.timeout_graceful_shutdown = 5
+            self.http_server.should_exit = True
+
+    def attach(self, http_server: uvicorn.Server) -> None:
+        """Apply child loss detected before HTTP startup as well as during service."""
+        self.http_server = http_server
+        if self.exited:
+            http_server.config.timeout_graceful_shutdown = 5
+            http_server.should_exit = True
+
+    def exit_if_exited(self) -> None:
+        """Let the existing supervisor restart this proxy after child loss."""
+        if self.exited:
+            raise SystemExit(1)
+
+
 async def run_mcp_server(
     mcp_settings: MCPServerSettings,
     default_server_params: StdioServerParameters | None = None,
@@ -378,6 +429,7 @@ async def run_mcp_server(
     if named_server_params is None:
         named_server_params = {}
 
+    stdio_exit = _StdioExitWatch()
     all_routes: list[BaseRoute] = [
         Route("/status", endpoint=_handle_status),  # Global status endpoint
     ]
@@ -398,7 +450,9 @@ async def run_mcp_server(
                 default_server_params.command,
                 " ".join(default_server_params.args),
             )
-            stdio_streams = await stack.enter_async_context(stdio_client(default_server_params))
+            stdio_streams = await stack.enter_async_context(
+                stdio_exit.client(default_server_params, "default"),
+            )
             session = await stack.enter_async_context(ClientSession(*stdio_streams))
             proxy = await create_proxy_server(session)
 
@@ -419,7 +473,7 @@ async def run_mcp_server(
                 params.command,
                 " ".join(params.args),
             )
-            stdio_streams_named = await stack.enter_async_context(stdio_client(params))
+            stdio_streams_named = await stack.enter_async_context(stdio_exit.client(params, name))
             session_named = await stack.enter_async_context(ClientSession(*stdio_streams_named))
             proxy_named = await create_proxy_server(session_named)
 
@@ -469,6 +523,7 @@ async def run_mcp_server(
             log_level=mcp_settings.log_level.lower(),
         )
         http_server = uvicorn.Server(config)
+        stdio_exit.attach(http_server)
 
         # Print out the SSE URLs for all configured servers
         base_url = f"http://{mcp_settings.bind_host}:{mcp_settings.port}"
@@ -494,3 +549,5 @@ async def run_mcp_server(
             mcp_settings.port,
         )
         await http_server.serve()
+
+    stdio_exit.exit_if_exited()

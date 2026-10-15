@@ -350,6 +350,16 @@ def mock_stdio_params() -> StdioServerParameters:
     )
 
 
+class _OpenStdout:
+    """Keep mocked child stdout open until the proxy finishes serving."""
+
+    def __aiter__(self) -> "_OpenStdout":
+        return self
+
+    async def __anext__(self) -> t.Any:  # noqa: ANN401
+        await asyncio.Event().wait()
+
+
 def setup_async_context_mocks() -> tuple[
     contextlib.AbstractContextManager[tuple[AsyncMock, AsyncMock]],
     contextlib.AbstractContextManager[tuple[AsyncMock, AsyncMock]],
@@ -359,7 +369,7 @@ def setup_async_context_mocks() -> tuple[
 ]:
     """Helper function to set up async context manager mocks."""
     # Setup stdio client mock
-    mock_streams = (AsyncMock(), AsyncMock())
+    mock_streams = (_OpenStdout(), AsyncMock())
 
     # Setup client session mock
     mock_session = AsyncMock()
