@@ -46,6 +46,7 @@ Write-Output "Validation mode: $Mode; raw logs: $logDir"
 Invoke-Validation 'git-diff' { git -C $repo diff --check }
 Invoke-Validation 'git-staged-diff' { git -C $repo diff --cached --check }
 Invoke-Validation 'ruff' { ruff check src tests }
+Invoke-Validation 'ruff-format' { ruff format --check src tests }
 Invoke-Validation 'pylint' { pylint --errors-only --disable=import-error src/mcp_proxy }
 
 if ($Mode -eq 'Full') {
