@@ -288,6 +288,12 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
         default=False,
     )
     mcp_server_group.add_argument(
+        "--streamable-http-get",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow the optional standalone Streamable HTTP GET event stream. Default is True",
+    )
+    mcp_server_group.add_argument(
         "--sse-port",
         type=int,
         default=0,
@@ -500,6 +506,7 @@ def _create_mcp_settings(args_parsed: argparse.Namespace) -> MCPServerSettings:
         bind_host=args_parsed.host if args_parsed.host is not None else args_parsed.sse_host,
         port=args_parsed.port if args_parsed.port is not None else args_parsed.sse_port,
         stateless=args_parsed.stateless,
+        streamable_http_get=args_parsed.streamable_http_get,
         allow_origins=args_parsed.allow_origin if len(args_parsed.allow_origin) > 0 else None,
         expose_headers=expose_headers,
         log_level="DEBUG" if args_parsed.debug else args_parsed.log_level,

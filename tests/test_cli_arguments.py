@@ -21,6 +21,18 @@ def parser() -> ArgumentParser:
     return _setup_argument_parser()
 
 
+@pytest.mark.parametrize(
+    ("flags", "enabled"),
+    [([], True), (["--streamable-http-get"], True), (["--no-streamable-http-get"], False)],
+)
+def test_streamable_http_get_policy(
+    parser: ArgumentParser, flags: list[str], *, enabled: bool
+) -> None:
+    """GET stream policy defaults on and propagates both Boolean CLI choices."""
+    args = parser.parse_args([*flags, "--port", "8080", "python", "server.py"])
+    assert _create_mcp_settings(args).streamable_http_get is enabled
+
+
 def test_verify_ssl_cli_false(parser: ArgumentParser) -> None:
     """Calling --verify-ssl false disables verification."""
     args = parser.parse_args(["--verify-ssl", "false", "https://example.com"])

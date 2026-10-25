@@ -49,6 +49,7 @@ class MCPServerSettings:
     allow_origins: list[str] | None = None
     expose_headers: list[str] = field(default_factory=_default_expose_headers)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    streamable_http_get: bool = True
 
 
 # To store last activity for multiple servers if needed, though status endpoint is global for now.
@@ -91,6 +92,7 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
     *,
     stateless_instance: bool,
     session_idle_timeout: float = 1800.0,
+    streamable_http_get: bool = True,
 ) -> tuple[list[BaseRoute], StreamableHTTPSessionManager]:  # Return the manager itself
     """Create Starlette routes and the HTTP session manager for a single MCP server instance."""
     logger.debug(
@@ -164,8 +166,13 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
     ) -> None:
         if scope.get("type") == "http":
             request = Request(scope)
-            if request.method == "HEAD":
-                await Response(status_code=405, headers={"Allow": "GET, POST, DELETE"})(
+            if request.method == "HEAD" or (request.method == "GET" and not streamable_http_get):
+                await Response(
+                    status_code=405,
+                    headers={
+                        "Allow": "GET, POST, DELETE" if streamable_http_get else "POST, DELETE"
+                    },
+                )(
                     scope,
                     receive,
                     send,
@@ -460,6 +467,7 @@ async def run_mcp_server(
                 proxy,
                 stateless_instance=mcp_settings.stateless,
                 session_idle_timeout=mcp_settings.session_idle_timeout,
+                streamable_http_get=mcp_settings.streamable_http_get,
             )
             await stack.enter_async_context(http_manager.run())  # Manage lifespan by calling run()
             all_routes.extend(instance_routes)
@@ -481,6 +489,7 @@ async def run_mcp_server(
                 proxy_named,
                 stateless_instance=mcp_settings.stateless,
                 session_idle_timeout=mcp_settings.session_idle_timeout,
+                streamable_http_get=mcp_settings.streamable_http_get,
             )
             await stack.enter_async_context(
                 http_manager_named.run(),

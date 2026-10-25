@@ -9,11 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 import pytest
 import uvicorn
 from httpx import ASGITransport, AsyncClient
+from httpx import Response as HTTPXResponse
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client, streamablehttp_client
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -36,6 +37,7 @@ def create_starlette_app(
     *,
     debug: bool = False,
     stateless: bool = False,
+    streamable_http_get: bool = True,
 ) -> Starlette:
     """Create a Starlette application for the MCP server.
 
@@ -44,11 +46,14 @@ def create_starlette_app(
         allow_origins: List of allowed CORS origins
         debug: Enable debug mode
         stateless: Whether to use stateless HTTP sessions
+        streamable_http_get: Whether to allow the optional standalone GET stream
 
     Returns:
         Starlette application instance
     """
-    routes, http_manager = create_single_instance_routes(mcp_server, stateless_instance=stateless)
+    routes, http_manager = create_single_instance_routes(
+        mcp_server, stateless_instance=stateless, streamable_http_get=streamable_http_get
+    )
 
     middleware: list[Middleware] = []
     if allow_origins:
@@ -73,6 +78,7 @@ def create_starlette_app(
         lifespan=lifespan,
     )
     app.router.redirect_slashes = False
+    app.state.http_manager = http_manager
     return app
 
 
@@ -225,7 +231,40 @@ class BackgroundServer(uvicorn.Server):
         return f"http://{hostport[0]}:{hostport[1]}"
 
 
-def make_background_server(*, debug: bool = False, stateless: bool = False) -> BackgroundServer:
+@pytest.mark.parametrize("stateless", [False, True])
+@pytest.mark.parametrize("prefix", ["", "/servers/example"])
+async def test_disabled_get_stream_never_reaches_session_manager(
+    *, stateless: bool, prefix: str
+) -> None:
+    """Reject all standalone GETs and HEADs before allocating or forwarding sessions."""
+    server: Server[object, t.Any] = Server("NoGetServer")
+    routes, manager = create_single_instance_routes(
+        server, stateless_instance=stateless, streamable_http_get=False
+    )
+    app = Starlette(routes=[Mount(prefix, routes=routes)] if prefix else routes)
+    with patch.object(manager, "handle_request", new_callable=AsyncMock) as handle:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            for path in ("/mcp", "/mcp/"):
+                for session_id in (None, "unknown-session"):
+                    headers = {"Accept": "text/event-stream"}
+                    if session_id:
+                        headers["mcp-session-id"] = session_id
+                    response = await client.get(prefix + path, headers=headers)
+                    assert response.status_code == 405
+                    assert response.headers["allow"] == "POST, DELETE"
+                    assert not response.content
+                response = await client.head(prefix + path)
+                assert response.status_code == 405
+                assert response.headers["allow"] == "POST, DELETE"
+            health = await client.get(prefix + "/healthz")
+            assert health.status_code == 204
+        handle.assert_not_awaited()
+        assert not manager._server_instances  # noqa: SLF001
+
+
+def make_background_server(
+    *, debug: bool = False, stateless: bool = False, streamable_http_get: bool = True
+) -> BackgroundServer:
     """Create a BackgroundServer instance with specified parameters."""
     mcp_server: Server[object, t.Any] = Server("TestServer")
 
@@ -263,15 +302,17 @@ def make_background_server(*, debug: bool = False, stateless: bool = False) -> B
         allow_origins=["*"],
         debug=debug,
         stateless=stateless,
+        streamable_http_get=streamable_http_get,
     )
 
     config = uvicorn.Config(app, port=0, log_level="info")
     return BackgroundServer(config)
 
 
-async def test_sse_transport() -> None:
+@pytest.mark.parametrize("streamable_http_get", [False, True])
+async def test_sse_transport(*, streamable_http_get: bool) -> None:
     """Test basic glue code for the SSE transport and a fake MCP server."""
-    server = make_background_server(debug=True)
+    server = make_background_server(debug=True, streamable_http_get=streamable_http_get)
     async with server.run_in_background():
         sse_url = f"{server.url}/sse"
         async with sse_client(url=sse_url) as streams, ClientSession(*streams) as session:
@@ -322,6 +363,67 @@ async def test_stateless_http_transport() -> None:
                 assert len(tool_result.content) == 1
                 assert isinstance(tool_result.content[0], types.TextContent)
                 assert tool_result.content[0].text == f"Echo: test_{i}"
+
+
+@pytest.mark.parametrize("path_suffix", ["/mcp", "/mcp/"])
+async def test_sdk_with_disabled_get_stream_preserves_calls_concurrency_and_delete(
+    path_suffix: str,
+) -> None:
+    """Real SDK clients tolerate GET 405 while concurrent calls and DELETE still work."""
+    server = make_background_server(streamable_http_get=False)
+    responses: list[tuple[str, int]] = []
+
+    async def record_response(response: HTTPXResponse) -> None:
+        responses.append((response.request.method, response.status_code))
+
+    async with server.run_in_background():
+        async with AsyncClient(event_hooks={"response": [record_response]}) as http_client:
+            async with (
+                streamable_http_client(server.url + path_suffix, http_client=http_client) as (
+                    read,
+                    write,
+                    session_id,
+                ),
+                ClientSession(read, write) as session,
+            ):
+                await session.initialize()
+                assert session_id()
+                listing = await session.list_tools()
+                assert [tool.name for tool in listing.tools] == ["echo"]
+                results = await asyncio.gather(
+                    *(session.call_tool("echo", {"message": str(index)}) for index in range(8))
+                )
+                assert [result.content[0].text for result in results] == [
+                    f"Echo: {index}" for index in range(8)
+                ]
+                assert not any(result.isError for result in results)
+            assert ("GET", 405) in responses
+            assert ("DELETE", 200) in responses
+            assert all(status in (200, 202, 405) for _, status in responses)
+        manager = server.config.app.state.http_manager
+        assert not manager._server_instances  # noqa: SLF001
+
+
+async def test_sdk_early_close_with_disabled_get_frees_session_and_recovers() -> None:
+    """Closing just after initialization retires the session; the next client still works."""
+    server = make_background_server(streamable_http_get=False)
+    async with server.run_in_background():
+        url = server.url + "/mcp"
+        async with (
+            streamable_http_client(url) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+        manager = server.config.app.state.http_manager
+        assert not manager._server_instances  # noqa: SLF001
+        async with (
+            streamable_http_client(url) as (read, write, _),
+            ClientSession(read, write) as session,
+        ):
+            await session.initialize()
+            result = await session.call_tool("echo", {"message": "after close"})
+            assert result.content[0].text == "Echo: after close"
+        assert not manager._server_instances  # noqa: SLF001
 
 
 # Unit tests for run_mcp_server method
@@ -396,11 +498,15 @@ async def test_run_mcp_server_no_servers_configured(mock_settings: MCPServerSett
         mock_logger.error.assert_called_once_with("No servers configured to run.")
 
 
+@pytest.mark.parametrize("streamable_http_get", [False, True])
 async def test_run_mcp_server_with_default_server(
     mock_settings: MCPServerSettings,
     mock_stdio_params: StdioServerParameters,
+    *,
+    streamable_http_get: bool,
 ) -> None:
     """Test run_mcp_server with a default server configuration."""
+    mock_settings.streamable_http_get = streamable_http_get
     with (
         patch("mcp_proxy.mcp_server.stdio_client") as mock_stdio_client,
         patch("mcp_proxy.mcp_server.ClientSession") as mock_client_session,
@@ -433,6 +539,7 @@ async def test_run_mcp_server_with_default_server(
             mock_proxy,
             stateless_instance=mock_settings.stateless,
             session_idle_timeout=mock_settings.session_idle_timeout,
+            streamable_http_get=mock_settings.streamable_http_get,
         )
         mock_logger.info.assert_any_call(
             "Setting up default server: %s %s",
@@ -442,11 +549,15 @@ async def test_run_mcp_server_with_default_server(
         mock_server_instance.serve.assert_called_once()
 
 
+@pytest.mark.parametrize("streamable_http_get", [False, True])
 async def test_run_mcp_server_with_named_servers(
     mock_settings: MCPServerSettings,
     mock_stdio_params: StdioServerParameters,
+    *,
+    streamable_http_get: bool,
 ) -> None:
     """Test run_mcp_server with named servers configuration."""
+    mock_settings.streamable_http_get = streamable_http_get
     named_servers = {
         "server1": mock_stdio_params,
         "server2": StdioServerParameters(
@@ -486,6 +597,10 @@ async def test_run_mcp_server_with_named_servers(
         assert mock_stdio_client.call_count == 2
         assert mock_create_proxy.call_count == 2
         assert mock_create_routes.call_count == 2
+        assert all(
+            call.kwargs["streamable_http_get"] is streamable_http_get
+            for call in mock_create_routes.call_args_list
+        )
 
         # Check that named servers were logged
         mock_logger.info.assert_any_call(
@@ -673,6 +788,7 @@ async def test_run_mcp_server_stateless_mode(
             mock_proxy,
             stateless_instance=True,
             session_idle_timeout=stateless_settings.session_idle_timeout,
+            streamable_http_get=stateless_settings.streamable_http_get,
         )
 
 

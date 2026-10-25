@@ -134,12 +134,25 @@ Arguments
 | `--allow-origin`                     | No                         | Allowed origins for the SSE server. Can be used multiple times. Default is no CORS allowed.   | --allow-origin "\*"                         |
 | `--expose-header`                    | No                         | Headers added to `Access-Control-Expose-Headers`. Can be used multiple times. Defaults to `mcp-session-id`. | --expose-header Custom-Header              |
 | `--stateless`                        | No                         | Enable stateless mode for streamable http transports. Default is False                        | --no-stateless                              |
+| `--streamable-http-get`              | No                         | Allow the optional standalone Streamable HTTP GET event stream. Default is True.             | --no-streamable-http-get                     |
 | `--named-server NAME COMMAND_STRING` | No                         | Defines a named stdio server.                                                                 | --named-server fetch 'uvx mcp-server-fetch' |
 | `--named-server-config FILE_PATH`    | No                         | Path to a JSON file defining named stdio servers.                                             | --named-server-config /path/to/servers.json |
 | `--sse-port` (deprecated)            | No, random available       | The SSE server port to listen on                                                              | 8080                                        |
 | `--sse-host` (deprecated)            | No, `127.0.0.1` by default | The host IP address that the SSE server will listen on                                        | 0.0.0.0                                     |
 
 ### 2.2 Example usage
+
+For a request/response-only deployment whose clients do not need standalone server events,
+`--no-streamable-http-get` rejects `GET /mcp` and `GET /mcp/` immediately with HTTP 405 and
+`Allow: POST, DELETE`. This avoids opening the optional long-lived GET stream; stateful
+initialization, tool requests over POST, and session termination over DELETE remain available.
+The policy applies to both the default server and named servers. Legacy `/sse` is unchanged.
+Keep the default enabled policy for clients that need standalone server notifications.
+This changes transport behavior rather than suppressing cancellation logs.
+
+```bash
+mcp-proxy --port 8080 --no-streamable-http-get -- python server.py
+```
 
 To start the `mcp-proxy` server that listens on port 8080 and connects to the local MCP server:
 
@@ -328,7 +341,8 @@ usage: mcp-proxy [-h] [--version] [-H KEY VALUE]
                  [--log-level LEVEL] [--debug | --no-debug]
                  [--named-server NAME COMMAND_STRING]
                  [--named-server-config FILE_PATH] [--port PORT] [--host HOST]
-                 [--stateless | --no-stateless] [--sse-port SSE_PORT]
+                 [--stateless | --no-stateless]
+                 [--streamable-http-get | --no-streamable-http-get] [--sse-port SSE_PORT]
                  [--sse-host SSE_HOST]
                  [--allow-origin ALLOW_ORIGIN [ALLOW_ORIGIN ...]]
                  [--expose-header HEADER]
@@ -378,6 +392,8 @@ SSE server options:
   --host HOST           Host to expose an SSE server on. Default is 127.0.0.1
   --stateless, --no-stateless
                         Enable stateless mode for streamable http transports. Default is False
+  --streamable-http-get, --no-streamable-http-get
+                        Allow the optional standalone Streamable HTTP GET event stream. Default is True
   --sse-port SSE_PORT   (deprecated) Same as --port
   --sse-host SSE_HOST   (deprecated) Same as --host
   --allow-origin ALLOW_ORIGIN [ALLOW_ORIGIN ...]
