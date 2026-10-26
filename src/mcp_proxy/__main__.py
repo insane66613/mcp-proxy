@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import shlex
 import sys
@@ -57,6 +58,21 @@ class _ExpectedStandaloneSseTeardownFilter(logging.Filter):
 
 
 _EXPECTED_STANDALONE_SSE_TEARDOWN_FILTER = _ExpectedStandaloneSseTeardownFilter()
+_MIN_SESSION_IDLE_TIMEOUT_SECONDS = 30.0
+_MAX_SESSION_IDLE_TIMEOUT_SECONDS = 3600.0
+
+
+def _session_idle_timeout(value: str) -> float:
+    """Require a finite inactivity timeout; do not accept accidental immediate expiry."""
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Session idle timeout must be numeric") from exc
+    if not math.isfinite(seconds) or not (
+        _MIN_SESSION_IDLE_TIMEOUT_SECONDS <= seconds <= _MAX_SESSION_IDLE_TIMEOUT_SECONDS
+    ):
+        raise argparse.ArgumentTypeError("Session idle timeout must be 30-3600 seconds")
+    return seconds
 
 
 def _normalize_verify_ssl(value: str | bool | None) -> bool | str | None:
@@ -294,6 +310,22 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
         help="Allow the optional standalone Streamable HTTP GET event stream. Default is True",
     )
     mcp_server_group.add_argument(
+        "--session-idle-timeout",
+        type=_session_idle_timeout,
+        default=1800.0,
+        metavar="SECONDS",
+        help="Expire inactive stateful HTTP sessions after SECONDS (30-3600; default 1800).",
+    )
+    mcp_server_group.add_argument(
+        "--access-log",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable Uvicorn per-request access logs (default on). "
+            "Disable when structured traces suffice."
+        ),
+    )
+    mcp_server_group.add_argument(
         "--sse-port",
         type=int,
         default=0,
@@ -506,6 +538,8 @@ def _create_mcp_settings(args_parsed: argparse.Namespace) -> MCPServerSettings:
         bind_host=args_parsed.host if args_parsed.host is not None else args_parsed.sse_host,
         port=args_parsed.port if args_parsed.port is not None else args_parsed.sse_port,
         stateless=args_parsed.stateless,
+        session_idle_timeout=args_parsed.session_idle_timeout,
+        access_log=args_parsed.access_log,
         streamable_http_get=args_parsed.streamable_http_get,
         allow_origins=args_parsed.allow_origin if len(args_parsed.allow_origin) > 0 else None,
         expose_headers=expose_headers,

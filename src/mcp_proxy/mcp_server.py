@@ -49,6 +49,7 @@ class MCPServerSettings:
     allow_origins: list[str] | None = None
     expose_headers: list[str] = field(default_factory=_default_expose_headers)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    access_log: bool = True
     streamable_http_get: bool = True
 
 
@@ -530,6 +531,7 @@ async def run_mcp_server(
             host=mcp_settings.bind_host,
             port=mcp_settings.port,
             log_level=mcp_settings.log_level.lower(),
+            access_log=mcp_settings.access_log,
         )
         http_server = uvicorn.Server(config)
         stdio_exit.attach(http_server)
