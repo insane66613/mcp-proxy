@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import typing as t
+from http import HTTPStatus
 from unittest.mock import Mock, patch
 
 import pytest
+from httpx import ASGITransport, AsyncClient
+from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
 
 from mcp_proxy.__main__ import _create_mcp_settings, _normalize_verify_ssl, _setup_argument_parser
 from mcp_proxy.httpx_client import custom_httpx_client
@@ -26,45 +30,30 @@ def parser() -> ArgumentParser:
 
 
 @pytest.mark.parametrize(
-    ("flags", "enabled"),
-    [([], True), (["--streamable-http-get"], True), (["--no-streamable-http-get"], False)],
+    "origin_flags",
+    [
+        ["--allow-origin", "https://first.example", "https://second.example"],
+        ["--allow-origin", "https://first.example", "--allow-origin", "https://second.example"],
+    ],
 )
-def test_streamable_http_get_policy(
-    parser: ArgumentParser, flags: list[str], *, enabled: bool
+async def test_allow_origin_flags_preserve_all_origins(
+    parser: ArgumentParser, origin_flags: list[str]
 ) -> None:
-    """GET stream policy defaults on and propagates both Boolean CLI choices."""
-    args = parser.parse_args([*flags, "--port", "8080", "python", "server.py"])
-    assert _create_mcp_settings(args).streamable_http_get is enabled
+    """Every origin supplied in one or multiple flags passes CORS preflight."""
+    args = parser.parse_args(["uvx", "mcp-server-fetch", *origin_flags])
+    settings = _create_mcp_settings(args)
+    origins = ["https://first.example", "https://second.example"]
+    assert settings.allow_origins == origins
 
-
-@pytest.mark.parametrize(
-    ("flags", "expected"),
-    [([], True), (["--access-log"], True), (["--no-access-log"], False)],
-)
-def test_access_log_policy(parser: ArgumentParser, flags: list[str], *, expected: bool) -> None:
-    """Disabling redundant access logs does not change lifecycle tracing."""
-    args = parser.parse_args([*flags, "python", "server.py"])
-    assert _create_mcp_settings(args).access_log is expected
-
-
-def test_stateful_idle_timeout_can_be_reduced_for_short_lived_clients(
-    parser: ArgumentParser,
-) -> None:
-    """Hosted clients can expire abandoned sessions without changing other proxies."""
-    args = parser.parse_args(["--session-idle-timeout", "120", "python", "server.py"])
-    assert _create_mcp_settings(args).session_idle_timeout == EXPECTED_HOSTED_TIMEOUT_SECONDS
-    default_args = parser.parse_args(["python", "server.py"])
-    assert (
-        _create_mcp_settings(default_args).session_idle_timeout == EXPECTED_DEFAULT_TIMEOUT_SECONDS
-    )
-
-
-@pytest.mark.parametrize("value", ["0", "10", "-1", "nan", "inf", "-inf", "garbage"])
-def test_stateful_idle_timeout_rejects_dangerous_values(parser: ArgumentParser, value: str) -> None:
-    """Reject nonfinite and too-small values before opening a listener."""
-    with pytest.raises(SystemExit) as exc:
-        parser.parse_args(["--session-idle-timeout", value, "python", "server.py"])
-    assert exc.value.code == EXPECTED_ARGPARSE_ERROR_EXIT_CODE
+    app = CORSMiddleware(Starlette(), allow_origins=settings.allow_origins, allow_methods=["GET"])
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for origin in origins:
+            response = await client.options(
+                "/sse",
+                headers={"Origin": origin, "Access-Control-Request-Method": "GET"},
+            )
+            assert response.status_code == HTTPStatus.OK
+            assert response.headers["Access-Control-Allow-Origin"] == origin
 
 
 def test_verify_ssl_cli_false(parser: ArgumentParser) -> None:
@@ -138,6 +127,24 @@ def test_create_mcp_settings_custom_expose_headers(parser: ArgumentParser) -> No
     assert settings.expose_headers == ["Custom-Header", "Another-Header"]
 
 
+def test_allowed_host_argument_accumulates_trusted_authorities(parser: ArgumentParser) -> None:
+    """Repeated --allowed-host flags are preserved for server settings."""
+    args = parser.parse_args(
+        [
+            "--allowed-host",
+            "mcp.example.com",
+            "--allowed-host",
+            "mcp.example.com:8443",
+            "uvx",
+            "mcp-server-fetch",
+        ],
+    )
+    assert _create_mcp_settings(args).allowed_hosts == [
+        "mcp.example.com",
+        "mcp.example.com:8443",
+    ]
+
+
 @patch("mcp_proxy.httpx_client.httpx.AsyncClient")
 def test_custom_httpx_client_disable_ssl(mock_async_client: Mock) -> None:
     """custom_httpx_client passes verify=False to httpx when disabled."""
@@ -152,3 +159,61 @@ def test_custom_httpx_client_cert_path(mock_async_client: Mock) -> None:
     custom_httpx_client(verify_ssl="/tmp/cert.pem")  # noqa: S108
     kwargs = mock_async_client.call_args.kwargs
     assert kwargs["verify"] == "/tmp/cert.pem"  # noqa: S108
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "invalid"])
+def test_initialization_timeout_rejects_invalid_values(parser: ArgumentParser, value: str) -> None:
+    """Initialization deadlines must be finite and positive."""
+    with pytest.raises(SystemExit):
+        parser.parse_args([f"--initialization-timeout={value}"])
+
+
+@pytest.mark.parametrize("value", [None, "2.5"])
+def test_initialization_timeout_settings(parser: ArgumentParser, value: str | None) -> None:
+    """Propagate the deadline while preserving the unlimited default."""
+    args = parser.parse_args([] if value is None else ["--initialization-timeout", value])
+    assert _create_mcp_settings(args).initialization_timeout == (
+        None if value is None else float(value)
+    )
+
+
+@pytest.mark.parametrize(
+    ("flags", "enabled"),
+    [([], True), (["--streamable-http-get"], True), (["--no-streamable-http-get"], False)],
+)
+def test_streamable_http_get_policy(
+    parser: ArgumentParser, flags: list[str], *, enabled: bool
+) -> None:
+    """GET stream policy defaults on and propagates both Boolean CLI choices."""
+    args = parser.parse_args([*flags, "--port", "8080", "python", "server.py"])
+    assert _create_mcp_settings(args).streamable_http_get is enabled
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [([], True), (["--access-log"], True), (["--no-access-log"], False)],
+)
+def test_access_log_policy(parser: ArgumentParser, flags: list[str], *, expected: bool) -> None:
+    """Disabling redundant access logs does not change lifecycle tracing."""
+    args = parser.parse_args([*flags, "python", "server.py"])
+    assert _create_mcp_settings(args).access_log is expected
+
+
+def test_stateful_idle_timeout_can_be_reduced_for_short_lived_clients(
+    parser: ArgumentParser,
+) -> None:
+    """Hosted clients can expire abandoned sessions without changing other proxies."""
+    args = parser.parse_args(["--session-idle-timeout", "120", "python", "server.py"])
+    assert _create_mcp_settings(args).session_idle_timeout == EXPECTED_HOSTED_TIMEOUT_SECONDS
+    default_args = parser.parse_args(["python", "server.py"])
+    assert (
+        _create_mcp_settings(default_args).session_idle_timeout == EXPECTED_DEFAULT_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "10", "-1", "nan", "inf", "-inf", "garbage"])
+def test_stateful_idle_timeout_rejects_dangerous_values(parser: ArgumentParser, value: str) -> None:
+    """Reject nonfinite and too-small values before opening a listener."""
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["--session-idle-timeout", value, "python", "server.py"])
+    assert exc.value.code == EXPECTED_ARGPARSE_ERROR_EXIT_CODE

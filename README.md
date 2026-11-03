@@ -54,6 +54,9 @@ graph LR
 This mode requires providing the URL of the MCP Server's SSE endpoint as the program’s first argument. If the server uses Streamable HTTP transport, make sure to enforce it on the `mcp-proxy` side by passing `--transport=streamablehttp`.
 
 When the proxy is a **Streamable HTTP client**, it bounds the final MCP session-termination `DELETE` request to five seconds. This prevents an unresponsive remote termination endpoint from indefinitely blocking shutdown. The shorter termination deadline does **not** apply to normal `GET` streams or `POST` tool calls, whose usual HTTP timeouts remain in effect. This limit is specific to reverse-client mode; it does not change the stateful/stateless behavior of proxied HTTP servers.
+When the proxy is a **Streamable HTTP client**, it bounds the final MCP session-termination `DELETE` request, including reading its response body, to five seconds. After cancellation or timeout, closing a received response gets a shielded, cooperative grace of up to one second; cleanup code that ignores cancellation can take longer. Graceful CLI teardown after SIGINT requires Python 3.11+; on Python 3.10, SIGINT may interrupt the event loop before the final `DELETE` is sent ([asyncio runner documentation](https://docs.python.org/3.11/library/asyncio-runner.html#handling-keyboard-interruption)). This limit applies only to that termination operation; normal `GET` streams and `POST` tool calls retain their usual HTTP timeouts. It is specific to reverse-client mode and does not change the stateful/stateless behavior of proxied HTTP servers.
+
+In reverse Streamable HTTP mode, an HTTP `404` on a `POST` for an established upstream session marks that session lost. The operation that received the `404` is never retried; its failure follows the existing proxy handling, and the server may already have applied it. A later explicit request may use a replacement session only when its complete initialization handshake matches the original. The proxy does not restore subscriptions, logging levels, or other upstream session-local state; after stateful resource or logging operations, or when the handshake changes, it refuses later requests and the MCP client must restart. Progress notifications are sent only to the current healthy session and are not buffered or replayed.
 
 Arguments
 
@@ -97,6 +100,16 @@ For Claude Desktop, the configuration entry can look like this:
 }
 ```
 
+Closing the client's stdin disconnects the remote session and cancels connection setup, initialization, and active
+requests. Queued input is abandoned. Each input frame is limited to 4 MiB of UTF-8 wire payload bytes, excluding
+CR/LF delimiters. At most 4 MiB and 128 frames may be admitted but not yet consumed; empty and malformed frames count
+toward the frame limit. Exceeding either limit exits with an error instead of silently dropping input. These are
+admission limits, not an exact memory limit, because decoded text and protocol objects use additional memory.
+
+The client must read or close stdout. A full, unread stdout pipe can prevent process exit. A cancelled blocking stdin
+read may leave one daemon thread and its private descriptor until the read returns or the process exits. The helper
+supports one active CLI lifespan per process.
+
 ## 2. SSE to stdio
 
 Run a proxy server exposing a SSE server that connects to a local stdio server.
@@ -116,10 +129,10 @@ graph LR
 
 ### 2.1 Configuration
 
-This mode requires the `--sse-port` argument to be set. The `--sse-host` argument can be set to specify the host IP
-address that the SSE server will listen on. Additional environment variables can be passed to the local stdio server
-using the `--env` argument. The command line arguments for the local stdio server must be passed after the `--`
-separator.
+Configure the HTTP server with `--host` and `--port`; the defaults are `127.0.0.1` and an available port. A wildcard
+bind such as `0.0.0.0` requires `--allowed-host` entries for the Host authorities clients will use. The deprecated
+`--sse-host` and `--sse-port` options are ineffective; use `--host` and `--port` instead. Additional environment
+variables can be passed to the local stdio server using `--env`. Put local server arguments after the `--` separator.
 
 Arguments
 
@@ -127,18 +140,20 @@ Arguments
 | ------------------------------------ | -------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------- |
 | `command_or_url`                     | Yes                        | The command to spawn the MCP stdio server                                                     | uvx mcp-server-fetch                        |
 | `--port`                             | No, random available       | The MCP server port to listen on                                                              | 8080                                        |
-| `--host`                             | No, `127.0.0.1` by default | The host IP address that the MCP server will listen on                                        | 0.0.0.0                                     |
+| `--host`                             | No, `127.0.0.1` by default | Host IP address to bind. Wildcard binds require explicit `--allowed-host` authorities.       | 0.0.0.0                                     |
+| `--allowed-host`                     | No                         | Additional trusted Host authority; repeat for each hostname/IP and port clients use.         | --allowed-host mcp.example.com:8080         |
 | `--env`                              | No                         | Additional environment variables to pass to the MCP stdio server. Can be used multiple times. | FOO BAR                                     |
 | `--cwd`                              | No                         | The working directory to pass to the MCP stdio server process.                                | /tmp                                        |
 | `--pass-environment`                 | No                         | Pass through all environment variables when spawning the server                               | --no-pass-environment                       |
 | `--allow-origin`                     | No                         | Allowed origins for the SSE server. Can be used multiple times. Default is no CORS allowed.   | --allow-origin "\*"                         |
 | `--expose-header`                    | No                         | Headers added to `Access-Control-Expose-Headers`. Can be used multiple times. Defaults to `mcp-session-id`. | --expose-header Custom-Header              |
+| `--initialization-timeout SECONDS`   | No                         | Deadline for each stdio server initialization; default is unlimited. Cleanup may take additional time. | --initialization-timeout 30                 |
 | `--stateless`                        | No                         | Enable stateless mode for streamable http transports. Default is False                        | --no-stateless                              |
 | `--streamable-http-get`              | No                         | Allow the optional standalone Streamable HTTP GET event stream. Default is True.             | --no-streamable-http-get                     |
 | `--named-server NAME COMMAND_STRING` | No                         | Defines a named stdio server.                                                                 | --named-server fetch 'uvx mcp-server-fetch' |
 | `--named-server-config FILE_PATH`    | No                         | Path to a JSON file defining named stdio servers.                                             | --named-server-config /path/to/servers.json |
-| `--sse-port` (deprecated)            | No, random available       | The SSE server port to listen on                                                              | 8080                                        |
-| `--sse-host` (deprecated)            | No, `127.0.0.1` by default | The host IP address that the SSE server will listen on                                        | 0.0.0.0                                     |
+| `--sse-port` (deprecated)            | No                         | Ineffective; use `--port` instead.                                                            | —                                           |
+| `--sse-host` (deprecated)            | No                         | Ineffective; use `--host` instead.                                                            | —                                           |
 
 ### 2.2 Example usage
 
@@ -161,16 +176,14 @@ To start the `mcp-proxy` server that listens on port 8080 and connects to the lo
 mcp-proxy uvx mcp-server-fetch
 
 # Start the MCP server behind the proxy with a custom port
-# (deprecated) mcp-proxy --sse-port=8080 uvx mcp-server-fetch
 mcp-proxy --port=8080 uvx mcp-server-fetch
 
 # Start the MCP server behind the proxy with a custom host and port
-# (deprecated) mcp-proxy --sse-host=0.0.0.0 --sse-port=8080 uvx mcp-server-fetch
-mcp-proxy --host=0.0.0.0 --port=8080 uvx mcp-server-fetch
+mcp-proxy --host=0.0.0.0 --port=8080 --allowed-host mcp.example.com:8080 uvx mcp-server-fetch
+# Replace mcp.example.com:8080 with the hostname/IP and port clients send in their Host header.
 
 # Start the MCP server behind the proxy with a custom user agent
 # Note that the `--` separator is used to separate the `mcp-proxy` arguments from the `mcp-server-fetch` arguments
-# (deprecated) mcp-proxy --sse-port=8080 -- uvx mcp-server-fetch --user-agent=YourUserAgent
 mcp-proxy --port=8080 -- uvx mcp-server-fetch --user-agent=YourUserAgent
 
 # Start multiple named MCP servers behind the proxy
@@ -269,6 +282,9 @@ uv tool install git+https://github.com/sparfenyuk/mcp-proxy
 Starting from version 0.3.2, it's possible to pull and run the corresponding container image.
 Release images are published to GHCR and Docker Hub as multi-platform manifests for `linux/amd64` and `linux/arm64`;
 Docker selects the matching image for the host architecture automatically.
+The runtime image includes `uv` and `uvx`, so Python MCP servers can be launched
+without building a separate image to install these executables. Installing tools
+with dependencies that are not already cached still requires network access.
 
 ```bash
 docker run --rm -t ghcr.io/sparfenyuk/mcp-proxy:v0.12.0 --help
@@ -292,22 +308,27 @@ docker run --rm -t sparfenyuk/mcp-proxy:v0.12.0 --help
 
 ## Extending the container image
 
-You can extend the `mcp-proxy` container image to include additional executables. For instance, `uv` is not included by
-default, but you can create a custom image with it:
+You can extend the `mcp-proxy` container image to include additional executables or
+configure the bundled `uv`. For example, this image restricts `uv` to the system Python:
 
 ```Dockerfile
 # file: mcp-proxy.Dockerfile
 
 FROM ghcr.io/sparfenyuk/mcp-proxy:latest
 
-# Install the 'uv' package
-RUN python3 -m ensurepip && pip install --no-cache-dir uv
-
-ENV PATH="/usr/local/bin:$PATH" \
-    UV_PYTHON_PREFERENCE=only-system
-
-ENTRYPOINT ["catatonit", "--", "mcp-proxy"]
+ENV UV_PYTHON_PREFERENCE=only-system
 ```
+
+To check a locally built image, run the opt-in container tests:
+
+```bash
+docker build -t mcp-proxy:test .
+MCP_PROXY_TEST_IMAGE=mcp-proxy:test uv run --frozen pytest -q tests/test_container_image.py
+```
+
+These tests disable container network access, run a local wheel through `uvx`, and
+launch an MCP server through `uv` to list and call a tool through the proxy.
+Without `MCP_PROXY_TEST_IMAGE`, the container tests are skipped.
 
 ## Docker Compose Setup
 
@@ -323,12 +344,13 @@ services:
     restart: unless-stopped
     ports:
       - 8096:8096
-    command: "--pass-environment --port=8096 --sse-host 0.0.0.0 uvx mcp-server-fetch"
+    command: "--pass-environment --host=0.0.0.0 --port=8096 --allowed-host mcp.example.com:8096 uvx mcp-server-fetch"
 ```
 
 > [!NOTE]
 > Don't forget to set `--pass-environment` argument, otherwise you'll end up with the error "No interpreter found in
 > managed installations or search path"
+> Replace `mcp.example.com:8096` with the hostname/IP and port clients send in their `Host` header.
 
 ## Command line arguments
 
@@ -345,6 +367,7 @@ usage: mcp-proxy [-h] [--version] [-H KEY VALUE]
                  [--streamable-http-get | --no-streamable-http-get] [--sse-port SSE_PORT]
                  [--sse-host SSE_HOST]
                  [--allow-origin ALLOW_ORIGIN [ALLOW_ORIGIN ...]]
+                 [--allowed-host HOST]
                  [--expose-header HEADER]
                  [command_or_url] [args ...]
 
@@ -390,16 +413,26 @@ stdio client options:
 SSE server options:
   --port PORT           Port to expose an SSE server on. Default is a random port
   --host HOST           Host to expose an SSE server on. Default is 127.0.0.1
+  --initialization-timeout SECONDS
+                        Maximum time to initialize each stdio server. By default, wait indefinitely.
+                        A timeout fails proxy startup and does not limit tool calls. Cleanup may take additional time.
   --stateless, --no-stateless
                         Enable stateless mode for streamable http transports. Default is False
   --streamable-http-get, --no-streamable-http-get
                         Allow the optional standalone Streamable HTTP GET event stream. Default is True
-  --sse-port SSE_PORT   (deprecated) Same as --port
-  --sse-host SSE_HOST   (deprecated) Same as --host
+  --sse-port SSE_PORT   (deprecated and ineffective; use --port)
+  --sse-host SSE_HOST   (deprecated and ineffective; use --host)
   --allow-origin ALLOW_ORIGIN [ALLOW_ORIGIN ...]
                         Allowed origins for the SSE server. Can be used multiple times. Default is no CORS allowed.
+  --allowed-host HOST   Additional trusted Host authority. Can be used multiple times.
   --expose-header HEADER
                         Headers to expose via Access-Control-Expose-Headers. Defaults to 'Mcp-Session-Id'. Can be used multiple times.
+
+HTTP server requests are checked against trusted Host authorities before reaching routes. Loopback hostnames and IPs are trusted by default; a non-wildcard `--host` also trusts that bind address. A wildcard bind does not trust arbitrary Host values. Add the public hostname or reverse-proxy Host with `--allowed-host`, repeating the option for each authority (for example, `--allowed-host mcp.example.com --allowed-host mcp.example.com:8443`). A terminal `:*` may be used for an authority that accepts any port.
+
+Raw Uvicorn HTTP access-log lines are disabled because SSE session IDs can appear in request query strings.
+
+Host and browser Origin are separate checks. `--allow-origin '*'` allows browser Origins but does not bypass Host validation. Native clients that omit Origin remain supported. These checks do not authenticate callers; protect publicly reachable deployments with network controls or an authenticated reverse proxy.
 
 Examples:
   mcp-proxy http://localhost:8080/sse

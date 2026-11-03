@@ -52,11 +52,13 @@ def _sanitize_retry_after(value: str | None) -> str:
     return normalized or "-"
 
 
-def custom_httpx_client(  # noqa: C901
+def custom_httpx_client(
     headers: dict[str, str] | None = None,
     timeout: httpx.Timeout | None = None,
     auth: httpx.Auth | None = None,
     verify_ssl: bool | str | None = None,
+    *,
+    client_class: type[httpx.AsyncClient] | None = None,
 ) -> httpx.AsyncClient:
     """Create a standardized HTTP client with bounded connector metrics.
 
@@ -69,28 +71,18 @@ def custom_httpx_client(  # noqa: C901
         auth: Optional authentication handler.
         verify_ssl: Control SSL verification. Use False to disable
             or a path to a certificate bundle.
+        client_class: Optional AsyncClient subclass for specialized transports.
 
     Returns:
         Configured httpx.AsyncClient instance with MCP defaults and logging.
     """
     # Set MCP defaults (copied from original implementation)
     kwargs: dict[str, Any] = {
-        "follow_redirects": True,
+        "timeout": timeout if timeout is not None else httpx.Timeout(30.0),
+        "headers": headers,
+        "auth": auth,
     }
-
-    # Handle timeout
-    if timeout is None:
-        kwargs["timeout"] = httpx.Timeout(30.0)
-    else:
-        kwargs["timeout"] = timeout
-
-    # Handle headers
-    if headers is not None:
-        kwargs["headers"] = headers
-
-    # Handle authentication
-    if auth is not None:
-        kwargs["auth"] = auth
+    kwargs["follow_redirects"] = False
 
     if verify_ssl is not None:
         normalized_verify: bool | str
@@ -146,4 +138,4 @@ def custom_httpx_client(  # noqa: C901
         "response": [log_response],
     }
 
-    return httpx.AsyncClient(**kwargs)
+    return (client_class or httpx.AsyncClient)(**kwargs)

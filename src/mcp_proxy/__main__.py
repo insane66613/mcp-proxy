@@ -89,6 +89,14 @@ def _normalize_verify_ssl(value: str | bool | None) -> bool | str | None:
     return value
 
 
+def _positive_timeout(value: str) -> float:
+    """Parse a finite, positive timeout in seconds."""
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a finite number greater than zero")
+    return timeout
+
+
 def _setup_argument_parser() -> argparse.ArgumentParser:
     """Set up and return the argument parser for the MCP proxy."""
     parser = argparse.ArgumentParser(
@@ -298,6 +306,16 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
         help="Host to expose an SSE server on. Default is 127.0.0.1",
     )
     mcp_server_group.add_argument(
+        "--initialization-timeout",
+        type=_positive_timeout,
+        metavar="SECONDS",
+        help=(
+            "Maximum time to initialize each stdio server. By default, wait indefinitely. "
+            "A timeout fails proxy startup; it does not limit tool calls. "
+            "Cleanup may take additional time."
+        ),
+    )
+    mcp_server_group.add_argument(
         "--stateless",
         action=argparse.BooleanOptionalAction,
         help="Enable stateless mode for streamable http transports. Default is False",
@@ -339,11 +357,19 @@ def _add_arguments_to_parser(parser: argparse.ArgumentParser) -> None:
     mcp_server_group.add_argument(
         "--allow-origin",
         nargs="+",
+        action="extend",
         default=[],
         help=(
             "Allowed origins for the SSE server. Can be used multiple times. "
             "Default is no CORS allowed."
         ),
+    )
+    mcp_server_group.add_argument(
+        "--allowed-host",
+        action="append",
+        default=None,
+        metavar="HOST",
+        help="Additional trusted Host authority. Can be used multiple times.",
     )
     mcp_server_group.add_argument(
         "--expose-header",
@@ -371,6 +397,18 @@ def _setup_logging(*, level: str, debug: bool) -> logging.Logger:
         for existing in streamable_http_logger.filters
     ):
         streamable_http_logger.addFilter(_EXPECTED_STANDALONE_SSE_TEARDOWN_FILTER)
+    for logger_name in (
+        "httpx",
+        "httpcore",
+        "mcp.client.sse",
+        "mcp.client.streamable_http",
+        "mcp.server.lowlevel.server",
+        "mcp.server.streamable_http_manager",
+        "mcp.server.sse",
+        "mcp.server.streamable_http",
+        "sse_starlette.sse",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     return logging.getLogger(__name__)
 
 
@@ -541,7 +579,9 @@ def _create_mcp_settings(args_parsed: argparse.Namespace) -> MCPServerSettings:
         session_idle_timeout=args_parsed.session_idle_timeout,
         access_log=args_parsed.access_log,
         streamable_http_get=args_parsed.streamable_http_get,
+        initialization_timeout=args_parsed.initialization_timeout,
         allow_origins=args_parsed.allow_origin if len(args_parsed.allow_origin) > 0 else None,
+        allowed_hosts=args_parsed.allowed_host,
         expose_headers=expose_headers,
         log_level="DEBUG" if args_parsed.debug else args_parsed.log_level,
     )

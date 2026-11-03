@@ -14,6 +14,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 from mcp import types
 from mcp.client.session import ClientSession
@@ -108,6 +109,41 @@ def server_can_list_tools(server: Server[object], tool: types.Tool) -> Server[ob
         return [tool]
 
     return server
+
+
+@pytest.mark.parametrize("cursor", ["8", ""])
+async def test_list_tools_pagination(
+    session_generator: SessionContextManager,
+    server: Server[object],
+    cursor: str,
+) -> None:
+    """Preserve pagination params, second-page tools and the terminal cursor through the proxy."""
+    tools = [types.Tool(name=f"tool-{index}", inputSchema={}) for index in range(14)]
+    received_params: list[types.PaginatedRequestParams | None] = []
+
+    async def list_tools(request: types.ListToolsRequest) -> types.ServerResult:
+        received_params.append(request.params)
+        if request.params is not None and request.params.cursor == cursor:
+            return types.ServerResult(types.ListToolsResult(tools=tools[8:]))
+        return types.ServerResult(types.ListToolsResult(tools=tools[:8], nextCursor=cursor))
+
+    server.request_handlers[types.ListToolsRequest] = list_tools
+
+    async with session_generator(server) as session:
+        await session.initialize()
+        first_page = await session.list_tools()
+        assert first_page.tools == tools[:8]
+        assert first_page.nextCursor == cursor
+
+        params = types.PaginatedRequestParams(
+            cursor=first_page.nextCursor,
+            _meta=types.RequestParams.Meta(progressToken="pagination"),
+        )
+        last_page = await session.list_tools(params=params)
+        assert last_page.tools == tools[8:]
+        assert last_page.nextCursor is None
+        assert first_page.tools + last_page.tools == tools
+        assert received_params == [None, params]
 
 
 @pytest.fixture
@@ -533,19 +569,47 @@ async def test_unsubscribe_resource(
         unsubscribe_callback.reset_mock()
 
 
+@pytest.mark.parametrize(
+    ("progress_token", "total", "message"),
+    [(1, 1, "Processing item 1"), ("request-token", None, ""), (0, None, None)],
+)
 async def test_send_progress_notification(
     session_generator: SessionContextManager,
     server_can_send_progress_notification: Server[object],
+    progress_token: str | int,
+    total: float | None,
+    message: str | None,
 ) -> None:
-    """Test send_progress_notification."""
-    async with session_generator(server_can_send_progress_notification) as session:
-        await session.initialize()
+    """Preserve client progress notification fields through the proxy."""
+    received: list[types.ProgressNotificationParams] = []
+    notification_received = anyio.Event()
 
+    async def record_progress(notification: types.ProgressNotification) -> None:
+        received.append(notification.params)
+        notification_received.set()
+
+    server_can_send_progress_notification.notification_handlers[types.ProgressNotification] = (
+        record_progress
+    )
+
+    async with session_generator(server_can_send_progress_notification) as session:
         await session.send_progress_notification(
-            progress_token=1,
+            progress_token=progress_token,
             progress=0.5,
-            total=1,
+            total=total,
+            message=message,
         )
+        with anyio.fail_after(5):
+            await notification_received.wait()
+
+        assert received == [
+            types.ProgressNotificationParams(
+                progressToken=progress_token,
+                progress=0.5,
+                total=total,
+                message=message,
+            ),
+        ]
 
 
 @pytest.mark.parametrize("complete_callback", [AsyncMock()])
@@ -566,7 +630,8 @@ async def test_complete(
 ) -> None:
     """Test complete."""
     async with session_generator(server_can_complete) as session:
-        await session.initialize()
+        initialize_result = await session.initialize()
+        assert initialize_result.capabilities.completions is not None
 
         complete_callback.return_value = None
         result = await session.complete(
@@ -585,6 +650,23 @@ async def test_complete(
             else None,
         )
         complete_callback.reset_mock()
+
+
+async def test_complete_not_supported(
+    session_generator: SessionContextManager,
+    server_can_list_tools: Server[object],
+) -> None:
+    """Do not advertise completions when the upstream only supports tools."""
+    async with session_generator(server_can_list_tools) as session:
+        result = await session.initialize()
+        assert result.capabilities.tools is not None
+        assert result.capabilities.completions is None
+
+        with pytest.raises(McpError, match="Method not found"):
+            await session.complete(
+                types.PromptReference(type="ref/prompt", name="prompt"),
+                argument={"name": "argument", "value": "value"},
+            )
 
 
 @pytest.mark.parametrize("tool_callback", [AsyncMock()])
