@@ -60,7 +60,7 @@ def _install_mock_transport(
     sys.version_info < (3, 11),
     reason="asyncio.run handles SIGINT gracefully starting with Python 3.11",
 )
-async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  # noqa: C901, PLR0915
+async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  # noqa: C901, PLR0912, PLR0915
     delete_mode: str,
 ) -> None:
     """A real stdio CLI bounds DELETE teardown and preserves SIGINT."""
@@ -257,7 +257,14 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         )
         await wait_response(3)
         sigint_at = time.monotonic()
-        process.send_signal(signal.SIGINT)
+        if os.name == "nt":
+            # Headless Windows subprocesses cannot receive POSIX SIGINT.
+            # Closing both stdin handles exercises the native MCP stdio EOF shutdown.
+            process.stdin.close()
+            os.close(retained_writer)
+            retained_writer = -1
+        else:
+            process.send_signal(signal.SIGINT)
         try:
             await asyncio.wait_for(delete_entered.wait(), timeout=5)
             delete_observed = True
@@ -266,15 +273,22 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         try:
             await asyncio.wait_for(process.wait(), timeout=6.5)
             exited_within_deadline = True
-            os.fstat(retained_writer)
+            if retained_writer >= 0:
+                os.fstat(retained_writer)
         except TimeoutError:
-            os.fstat(retained_writer)
+            if retained_writer >= 0:
+                os.fstat(retained_writer)
     finally:
         release_delete.set()
         if process.returncode is None:
-            await asyncio.wait_for(process.wait(), timeout=5)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
         process.stdin.close()
-        os.close(retained_writer)
+        if retained_writer >= 0:
+            os.close(retained_writer)
         await stdout_task
         stderr = (await stderr_task).decode()
         server.close()
@@ -286,13 +300,16 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
-    assert delete_observed, f"CLI did not issue DELETE after SIGINT: {stderr!r}"
+    assert delete_observed, f"CLI did not issue DELETE on shutdown: {stderr!r}"
     assert exited_within_deadline, "CLI remained blocked past the five-second DELETE deadline"
     assert sigint_at is not None
     elapsed = time.monotonic() - sigint_at
     assert elapsed < (3 if delete_mode == "immediate" else 6.5)
-    assert process.returncode != 0
-    assert "KeyboardInterrupt" in stderr
+    if os.name == "nt":
+        assert process.returncode == 0, stderr
+    else:
+        assert process.returncode != 0
+        assert "KeyboardInterrupt" in stderr
     assert f"MCP_PROXY_STREAMABLE_SOURCE={source_file}" in stderr
     assert not handlers
 

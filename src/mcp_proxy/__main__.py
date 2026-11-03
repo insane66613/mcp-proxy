@@ -26,6 +26,7 @@ from .config_loader import load_named_server_configs_from_file
 from .mcp_server import DEFAULT_EXPOSE_HEADERS, MCPServerSettings, run_mcp_server
 from .sse_client import run_sse_client
 from .streamablehttp_client import run_streamablehttp_client
+from .win32_job import ensure_proxy_child_job
 
 # Deprecated env var. Here for backwards compatibility.
 SSE_URL: t.Final[str | None] = os.getenv(
@@ -651,6 +652,9 @@ def main() -> None:
             "No stdio servers configured. Provide a default command or use --named-server.",
         )
         sys.exit(1)
+
+    # A Windows-killed proxy must not leave orphaned stdio children.
+    ensure_proxy_child_job()
 
     # Create MCP server settings and run the server
     mcp_settings = _create_mcp_settings(args_parsed)

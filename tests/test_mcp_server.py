@@ -259,9 +259,19 @@ async def _stop_stdio_proxy(process: asyncio.subprocess.Process) -> None:
 
 
 def _assert_pid_reaped(pid_file: Path) -> None:
-    if sys.platform != "win32":
+    process_id = int(pid_file.read_text())
+    if sys.platform == "win32":
+        import time  # noqa: PLC0415
+
+        from winpipe import process_is_running  # noqa: PLC0415
+
+        deadline = time.monotonic() + 5
+        while process_is_running(process_id) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not process_is_running(process_id), "Windows stdio child survived proxy exit"
+    else:
         with pytest.raises(ProcessLookupError):
-            os.kill(int(pid_file.read_text()), 0)
+            os.kill(process_id, 0)
 
 
 def create_starlette_app(
@@ -1746,7 +1756,9 @@ async def test_omitted_initialization_timeout_allows_delayed_initialize(tmp_path
 
     assert initialize_received.exists()
     assert initialized.exists()
-    assert child_stopped.exists()
+    if sys.platform != "win32":
+        # Windows TerminateProcess cannot run the child's graceful EOF epilogue.
+        assert child_stopped.exists()
     _assert_pid_reaped(child_pid)
 
 
@@ -1801,5 +1813,6 @@ async def test_initialization_timeout_does_not_limit_later_tool_call(tmp_path: P
     assert initialized.exists()
     assert tool_call_entered.exists()
     assert tool_call_finished.exists()
-    assert child_stopped.exists()
+    if sys.platform != "win32":
+        assert child_stopped.exists()
     _assert_pid_reaped(child_pid)

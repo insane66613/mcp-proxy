@@ -1,7 +1,7 @@
 # SanityCloud mcp-proxy upstream 0.14.0 integration receipt
 
 **Date:** 2026-11-03 (America/Chicago)
-**Status:** SOURCE INTEGRATED / VALIDATED SUBSET / PRODUCTION CUTOVER BLOCKED
+**Status:** FULL WINDOWS TEST GATE PASSED / PACKAGED CANARY VERIFIED / PRODUCTION CUTOVER BLOCKED ON LIVE CURSOR TOOL PARITY
 **Authority:** User authorized the integration and conditional cutover; no production changes were made.
 **Repository:** `X:\Code\mcp-proxy`
 **Isolated worktree:** `X:\Worktrees\mcp-proxy\integrate-upstream-v0.14.0-20261103`
@@ -65,3 +65,36 @@ They must not be silently converted into passes or treated as sufficient for a l
 The launcher at `X:\Code\sanity-cloud-ai-portal\scripts\start-cursor-commander-mcp-proxy.ps1`
 uses `X:\Code\mcp-proxy\.venv-cursor-commander\Scripts\mcp-proxy.exe`, which must not
 be redirected to the candidate until the remaining release gates pass.
+
+---
+
+## 2026-11-03 Windows acceptance and packaging update
+
+This section supersedes the earlier unverified Windows shutdown gates above.
+Previous 414-pass subset and 5-deselection result remains historical, not current.
+
+- **Full suite:** 419 passed, 5 skipped, 0 failed, 0 deselected; exit 0 (81.62 seconds).
+- **Static:** mypy 14 source files passed; pylint error-only passed; Ruff targeted passed with pre-existing CPY001 and upstream SIM117 rule exclusions; `git diff --check` passed.
+- **Windows subprocess:** job-object kill-on-close protection added before stdio child spawn. Failed job setup is fatal; child handle is not inherited.
+- **Real force-stop proof:** candidate canary pid 333888 and packaged-wheel canary pid 47340 each spawned two descendants. Forced stop left 0 descendants and closed isolated port 18766.
+- **MCP canary:** initialize + list tools + call echo_canary succeeded with the worktree build and separately with the packaged release wheel.
+- **Wheel:** `mcp_proxy-0.14.0-py3-none-any.whl`, SHA256 `236EB424CA0E4A6A44CA2DB09AE37F05C493303C5F03E0F7019F3A5D1BC4FD4E`.
+- **Runtime:** `X:\MCP\runtimes\mcp-proxy-0.14.0-20261103`, Python 3.14.7, dependency versions exported from the locked project environment, wheel installed non-editably.
+
+## Operational parity blocker: Cursor Commander
+
+- The six existing proxy services at 3020, 3022, 3030, 3072, 8140, and 8766 all returned HTTP 204 for localhost `/healthz`.
+- Existing Cursor Commander `http://127.0.0.1:8766/mcp` responds to MCP initialize as `cursor-commander` version `0.1.0`.
+- A real `tools/list` call fails against **the existing 0.13.0 runtime** with MCP error code 0 and an empty message.
+- Reproduced with both Python 3.12.11 (existing `.venv-cursor-commander`) and Python 3.14.7 (candidate release runtime); both use MCP SDK 1.30.0.
+- Tool-list baseline receipt could not be created. This is a pre-existing baseline issue, not evidence that 0.14.0 failed.
+- Production Cursor Commander cutover is **HOLD** until the backend tool-list issue is reconciled or an explicitly approved alternative parity gate is documented.
+- No changes were made to the running proxy, its two version-0.13.0 environments, PID record, portal launchers, or unrelated dirty portal files.
+- Existing version-0.13.0 release remains the immediate rollback target.
+- The installed versioned 0.14.0 runtime is staged, not actively used by any production proxy.
+
+## Operational next action
+
+Investigate Cursor Commander `tools/list` within its existing backend/session.
+After a sound baseline is available, capture exact tool names and semantics before and after a single-service cutover.
+Preserve the current portal repository's unrelated local changes and the PID-scoped stop/start launcher contracts.
