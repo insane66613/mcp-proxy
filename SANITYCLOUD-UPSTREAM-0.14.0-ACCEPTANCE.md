@@ -1,7 +1,7 @@
 # SanityCloud mcp-proxy upstream 0.14.0 integration receipt
 
 **Date:** 2026-11-03 (America/Chicago)
-**Status:** FULL WINDOWS TEST GATE PASSED / PACKAGED CANARY VERIFIED / PRODUCTION CUTOVER BLOCKED ON LIVE CURSOR TOOL PARITY
+**Status:** CURSOR COMMANDER 0.14.0 LIVE / LOCAL AND CHATGPT CONNECTOR VERIFIED; OTHER PROXIES UNCHANGED
 **Authority:** User authorized the integration and conditional cutover; no production changes were made.
 **Repository:** `X:\Code\mcp-proxy`
 **Isolated worktree:** `X:\Worktrees\mcp-proxy\integrate-upstream-v0.14.0-20261103`
@@ -98,3 +98,25 @@ Previous 414-pass subset and 5-deselection result remains historical, not curren
 Investigate Cursor Commander `tools/list` within its existing backend/session.
 After a sound baseline is available, capture exact tool names and semantics before and after a single-service cutover.
 Preserve the current portal repository's unrelated local changes and the PID-scoped stop/start launcher contracts.
+
+---
+
+## 2026-11-03 final operational closure (supersedes earlier HOLD)
+
+- **Root cause established:** Cursor Commander backend's direct MCP stdio exposed six tools and passed `tools/list`. Existing mcp-proxy 0.13.0 returned MCP error code 0 with empty text for HTTP `tools/list`; isolated mcp-proxy 0.14.0 succeeded against the same backend.
+- **Production configuration parity:** The managed ChatGPT bridge is enabled. With scoped bridge configuration, both isolated candidate and live 0.14.0 proxy advertise eight tools. Exact name-list fingerprint SHA256: `1e173276d77212b9576008d7c0ee6c16160556042cab6bcbb50f78977d5f14bf`.
+- **Read-only MCP tool call:** `cursor_dashboard` succeeded on both candidate and live proxy; 13 recorded jobs and no jobs marked active in the dashboard snapshot.
+- **Release package:** `mcp_proxy-0.14.0-py3-none-any.whl`, SHA256 `236EB424CA0E4A6A44CA2DB09AE37F05C493303C5F03E0F7019F3A5D1BC4FD4E`.
+- **Release runtime:** `X:\MCP\runtimes\mcp-proxy-0.14.0-20261103` (version 0.14.0, non-editable wheel).
+- **Local acceptance:** full 419-passed/5-skipped suite, mypy and pylint success, target Ruff and PowerShell 7 parse checks. Portal launcher test suite 65 passed, plus exact-host security test 7 passed.
+
+- **First local cutover:** Portal feature commit `f65f2ae281883546004d77f35bd3d19f31588137` changed only Cursor Commander's start/stop default executable to the immutable versioned runtime. Former PID 256416 was stopped with identity-scoped service script; PID 51276 ran 0.14.0 and passed HTTP 204, eight-tool manifest parity, and dashboard call.
+- **Public ingress issue:** ChatGPT Cursor Command plugin initially received HTTP 421 Misdirected Request for `https://cursor-commander.ptelectronics.net/mcp`. The release's transport security rejects unknown Host authorities with 421. This was not an authentication or backend-tool problem.
+- **Narrow host fix:** Portal commit `770e3a7cc6fe8da34a0280a2dc82564825558e8a` added only `--allowed-host cursor-commander.ptelectronics.net` to the Cursor proxy launcher. DNS rebinding protection remains enabled, no wildcard trust was added, and `--pass-environment` remains prohibited.
+- **Final live PID:** 629072 at `X:\MCP\runtimes\mcp-proxy-0.14.0-20261103\Scripts\mcp-proxy.exe` with exact public hostname allowlisted, port 8766, local health HTTP 204.
+- **ChatGPT connector verified:** `cursor_status` responded `operational` / `trusted`, total sessions 97, recent jobs 5. `cursor_dashboard` responded `operational`, 13 jobs, zero marked active. This confirms end-to-end authenticated connector functionality.
+- **Other endpoints:** 3020, 3022, 3030, 3072, and 8140 each returned HTTP 204 after the Cursor-only cutover. Port 18766 canary was closed. Other production proxy runtimes were not replaced.
+- **Rollback:** The prior Cursor v0.13.0 executable and environment remain at `X:\Code\mcp-proxy\.venv-cursor-commander`. Both launchers accept the scoped `CURSOR_COMMANDER_PROXY_EXE` override. Old release and original repository remain intact.
+- **Governance:** Portal `main` includes only the two approved local feature commits. Its unrelated pre-existing modifications remain untouched. No remote push, other-service restart, credential change, or Cloudflare control-plane mutation was made.
+
+**Final service decision:** Cursor Commander release 0.14.0 ACCEPTED LIVE. Earlier local/remote blockers are resolved. No other production proxy is represented as upgraded.
