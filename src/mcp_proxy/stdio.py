@@ -130,7 +130,9 @@ class _ReleasingInput(ObjectReceiveStream[SessionMessage | Exception]):
 
 @asynccontextmanager
 async def stdio_client_lifespan(
-    *, graceful_eof_ready: anyio.Event | None = None
+    *,
+    graceful_eof_ready: anyio.Event | None = None,
+    graceful_eof_observed: anyio.Event | None = None,
 ) -> AsyncIterator[
     tuple[
         MemoryObjectReceiveStream[SessionMessage | Exception],
@@ -156,6 +158,8 @@ async def stdio_client_lifespan(
             # close normally. Cancellation during startup must remain immediate.
             if graceful_eof_ready is None or not graceful_eof_ready.is_set():
                 tasks.cancel_scope.cancel()
+            elif graceful_eof_observed is not None:
+                graceful_eof_observed.set()
 
         async with _ReleasingInput(receiver, budget) as read_stream:
             tasks.start_soon(forward_stdin)

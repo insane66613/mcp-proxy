@@ -56,17 +56,21 @@ def _install_mock_transport(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delete_mode", ["headers", "body", "immediate"])
+@pytest.mark.parametrize("pending_tool", [False, True])
 @pytest.mark.skipif(
     sys.version_info < (3, 11),
     reason="asyncio.run handles SIGINT gracefully starting with Python 3.11",
 )
 async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  # noqa: C901, PLR0912, PLR0915
     delete_mode: str,
+    pending_tool: bool,
 ) -> None:
     """A real stdio CLI bounds DELETE teardown and preserves SIGINT."""
     session_id = "cli-delete-body-session"
     delete_entered = asyncio.Event()
     release_delete = asyncio.Event()
+    tool_entered = asyncio.Event()
+    release_tool = asyncio.Event()
     responses: dict[int, dict[str, Any]] = {}
     response_available = asyncio.Event()
     source_file = _SOURCE_FILE
@@ -100,6 +104,9 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
             body = await reader.readexactly(int(headers.get("content-length", "0")))
             message = json.loads(body) if body else {}
             rpc_method = message.get("method")
+            if rpc_method == "tools/call" and pending_tool:
+                tool_entered.set()
+                await release_tool.wait()
 
             if method == "GET":
                 writer.write(
@@ -255,7 +262,10 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 "params": {"name": "echo", "arguments": {}},
             }
         )
-        await wait_response(3)
+        if pending_tool:
+            await asyncio.wait_for(tool_entered.wait(), timeout=5)
+        else:
+            await wait_response(3)
         sigint_at = time.monotonic()
         if os.name == "nt":
             # Headless Windows subprocesses cannot receive POSIX SIGINT.
@@ -271,7 +281,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         except (TimeoutError, asyncio.TimeoutError):
             pass
         try:
-            await asyncio.wait_for(process.wait(), timeout=6.5)
+            await asyncio.wait_for(process.wait(), timeout=9.5 if pending_tool else 6.5)
             exited_within_deadline = True
             if retained_writer >= 0:
                 os.fstat(retained_writer)
@@ -280,6 +290,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 os.fstat(retained_writer)
     finally:
         release_delete.set()
+        release_tool.set()
         if process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), timeout=5)
@@ -304,7 +315,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
     assert exited_within_deadline, "CLI remained blocked past the five-second DELETE deadline"
     assert sigint_at is not None
     elapsed = time.monotonic() - sigint_at
-    assert elapsed < (3 if delete_mode == "immediate" else 6.5)
+    assert elapsed < (9.5 if pending_tool else (3 if delete_mode == "immediate" else 6.5))
     if os.name == "nt":
         assert process.returncode == 0, stderr
     else:

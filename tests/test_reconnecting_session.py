@@ -33,7 +33,7 @@ from mcp_proxy.reconnecting_session import (
     SessionFactory,
     SessionObserver,
 )
-from mcp_proxy.streamablehttp_client import _SessionTerminationAsyncClient
+from mcp_proxy.streamablehttp_client import _run_with_bounded_eof, _SessionTerminationAsyncClient
 
 _RECOVERY_SOURCE_FILE = Path(reconnecting_session_module.__file__).resolve()
 _RECOVERY_SOURCE_ROOT = _RECOVERY_SOURCE_FILE.parents[1]
@@ -800,6 +800,36 @@ async def test_cancelled_replacement_initialize_closes_candidate_owner() -> None
 
     finally:
         await wrapper.__aexit__(None, None, None)
+
+    assert upstream.connects == TWO_CONNECTS
+    assert upstream.exits == TWO_CONNECTS
+    assert upstream.owner_entries == upstream.owner_exits
+
+
+@pytest.mark.asyncio
+async def test_eof_watchdog_cancels_stalled_reconnect_before_owner_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EOF timeout must release a blocked reconnect and dispose both owners."""
+    import mcp_proxy.streamablehttp_client as reverse_client  # noqa: PLC0415
+
+    monkeypatch.setattr(reverse_client, "_EOF_DRAIN_GRACE_SECONDS", 0.04)
+    reconnect_gate = gate()
+    upstream = FakeUpstream(scripts=[{"list_tools": [Http404(session_lost())]}])
+    upstream.initialize_gates[1] = reconnect_gate
+    eof_observed = anyio.Event()
+
+    async def recover(wrapper: ReconnectingClientSession) -> None:
+        await wrapper.list_tools()
+
+    with anyio.fail_after(LIFECYCLE_TIMEOUT):
+        async with open_wrapper(upstream.connect) as wrapper:
+            with pytest.raises(McpError):
+                await wrapper.list_tools()
+            async with anyio.create_task_group() as tasks:
+                tasks.start_soon(_run_with_bounded_eof, lambda: recover(wrapper), eof_observed)
+                await reconnect_gate.started.wait()
+                eof_observed.set()
 
     assert upstream.connects == TWO_CONNECTS
     assert upstream.exits == TWO_CONNECTS
