@@ -16,7 +16,7 @@ _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 
 
 class _BasicLimit(ctypes.Structure):
-    _fields_ = [
+    _fields_ = [  # noqa: RUF012 - ctypes.Structure requires a class-level schema
         ("PerProcessUserTimeLimit", ctypes.c_longlong),
         ("PerJobUserTimeLimit", ctypes.c_longlong),
         ("LimitFlags", wintypes.DWORD),
@@ -30,7 +30,7 @@ class _BasicLimit(ctypes.Structure):
 
 
 class _IoCounters(ctypes.Structure):
-    _fields_ = [
+    _fields_ = [  # noqa: RUF012 - ctypes.Structure requires a class-level schema
         (name, ctypes.c_ulonglong)
         for name in (
             "ReadOperationCount",
@@ -44,7 +44,7 @@ class _IoCounters(ctypes.Structure):
 
 
 class _ExtendedLimit(ctypes.Structure):
-    _fields_ = [
+    _fields_ = [  # noqa: RUF012 - ctypes.Structure requires a class-level schema
         ("BasicLimitInformation", _BasicLimit),
         ("IoInfo", _IoCounters),
         ("ProcessMemoryLimit", ctypes.c_size_t),

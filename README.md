@@ -130,9 +130,27 @@ graph LR
 ### 2.1 Configuration
 
 Configure the HTTP server with `--host` and `--port`; the defaults are `127.0.0.1` and an available port. A wildcard
-bind such as `0.0.0.0` requires `--allowed-host` entries for the Host authorities clients will use. The deprecated
-`--sse-host` and `--sse-port` options are ineffective; use `--host` and `--port` instead. Additional environment
-variables can be passed to the local stdio server using `--env`. Put local server arguments after the `--` separator.
+bind such as `0.0.0.0` requires `--allowed-host` entries for the Host authorities clients will use. These host checks
+and CORS settings do not authenticate callers by default. `--headers` and `API_ACCESS_TOKEN` authenticate upstream
+client requests; they do not authenticate callers of this server.
+
+To require inbound authentication, set `MCP_PROXY_AUTH_TOKEN` or pass `--auth-bearer-token TOKEN`. An explicit CLI
+value takes precedence over the environment variable. Prefer the environment variable because local process tools may
+show command-line arguments. With neither value set, the server keeps its unauthenticated default. When enabled, every
+HTTP request needs `Authorization: Bearer TOKEN`, including requests to `/status`, `/healthz`, SSE, StreamableHTTP,
+and named-server routes. Health probes must send the token. Configured CORS preflight requests still work without a
+token; ordinary `OPTIONS` requests require one. Host and Origin checks continue to apply.
+
+`MCP_PROXY_AUTH_TOKEN` is removed from child processes when `--pass-environment` copies the proxy environment.
+Values passed explicitly with `--env` or a named-server configuration remain part of that server's environment.
+This shared token does not provide user identity or roles and does not make the proxy compliant with MCP OAuth.
+Use TLS or a trusted network/reverse proxy when exposing the server beyond a trusted local network.
+
+The deprecated `--sse-host` and `--sse-port` options are ineffective; use `--host` and `--port` instead. Additional
+environment variables can be passed to the local stdio server using `--env`. Put local server arguments after the `--` separator.
+
+Startup logs list the SSE and StreamableHTTP endpoints for each configured backend. With `--port=0`, they list endpoint
+paths because Uvicorn selects the actual port during startup; combine each path with Uvicorn's listening address.
 
 Arguments
 
@@ -141,6 +159,7 @@ Arguments
 | `command_or_url`                     | Yes                        | The command to spawn the MCP stdio server                                                     | uvx mcp-server-fetch                        |
 | `--port`                             | No, random available       | The MCP server port to listen on                                                              | 8080                                        |
 | `--host`                             | No, `127.0.0.1` by default | Host IP address to bind. Wildcard binds require explicit `--allowed-host` authorities.       | 0.0.0.0                                     |
+| `--auth-bearer-token`                | No                         | Require one shared Bearer token on every inbound HTTP request. Prefer `MCP_PROXY_AUTH_TOKEN`. | `<TOKEN>`                                  |
 | `--allowed-host`                     | No                         | Additional trusted Host authority; repeat for each hostname/IP and port clients use.         | --allowed-host mcp.example.com:8080         |
 | `--env`                              | No                         | Additional environment variables to pass to the MCP stdio server. Can be used multiple times. | FOO BAR                                     |
 | `--cwd`                              | No                         | The working directory to pass to the MCP stdio server process.                                | /tmp                                        |
@@ -207,7 +226,17 @@ mcp-proxy --port=8080 --allow-origin='*' --expose-header Custom-Header uvx mcp-s
 If a default server is specified (the `command_or_url` argument without `--named-server` or `--named-server-config`), it will be accessible at the root paths (e.g., `http://127.0.0.1:8080/sse`).
 
 Named servers (whether defined by `--named-server` or `--named-server-config`) will be accessible under `/servers/<server-name>/` (e.g., `http://127.0.0.1:8080/servers/fetch1/sse`).
-The `/status` endpoint provides global status.
+The `/status` endpoint provides global status. Its `server_instances` keys normally use the configured
+named-server names and `default` for the positional server. If both a positional server and a named
+server called `default` are configured, all entries use route keys instead: `/` for the positional
+server and `/servers/<name>` for named servers. This keeps both instances distinct without reserving
+a configured name.
+
+If a named server fails with a spawn-stage operating-system error other than `TimeoutError`, an MCP
+initialization error, an initialization timeout, or stdout EOF observed before activation, `mcp-proxy`
+marks it as `failed` in `/status` and continues with the remaining named servers. Failed servers have
+no routes or advertised endpoints. Other startup failures, cleanup failures, and failures in the
+positional server remain fatal. Startup exits with an error if none of the configured servers starts.
 
 **JSON Configuration File Format for `--named-server-config`:**
 
@@ -280,11 +309,29 @@ uv tool install git+https://github.com/sparfenyuk/mcp-proxy
 ### Installing as container
 
 Starting from version 0.3.2, it's possible to pull and run the corresponding container image.
-Release images are published to GHCR and Docker Hub as multi-platform manifests for `linux/amd64` and `linux/arm64`;
+Images are published to GHCR and Docker Hub as multi-platform manifests for `linux/amd64` and `linux/arm64`;
 Docker selects the matching image for the host architecture automatically.
-The runtime image includes `uv` and `uvx`, so Python MCP servers can be launched
-without building a separate image to install these executables. Installing tools
-with dependencies that are not already cached still requires network access.
+
+The runtime image flavors are:
+
+| Flavor | Base | Tools |
+| --- | --- | --- |
+| `alpine` | Python 3.13 on Alpine Linux (musl) | `uv`, `uvx` |
+| `debian` | Python 3.13 on Debian Bookworm (glibc) | `uv`, `uvx` |
+| `debian-node` | Debian Bookworm (glibc) | `uv`, `uvx`, Node.js 24, `npm`, `npx` |
+
+The unsuffixed tags and `-alpine` tags select the Alpine image. For a release
+tag such as `vX.Y.Z`, the Debian images use `vX.Y.Z-debian` and
+`vX.Y.Z-debian-node`; main-branch commit tags use the matching
+`commit-<short-sha>-debian` and `commit-<short-sha>-debian-node` forms. New
+flavors are available only for builds made after this change is released;
+existing tags are not rebuilt. The existing automatic `latest` release alias
+continues to select Alpine. Debian flavors have no moving alias.
+
+Choose Debian when a Python package needs glibc. Choose `debian-node` when the
+MCP server needs Node.js tools; it can run `npx` packages but does not bundle
+all possible server-specific system libraries. Installing tools with
+dependencies that are not already cached still requires network access.
 
 ```bash
 docker run --rm -t ghcr.io/sparfenyuk/mcp-proxy:v0.12.0 --help
@@ -306,29 +353,53 @@ docker run --rm -t sparfenyuk/mcp-proxy:v0.12.0 --help
     }
   ```
 
-## Extending the container image
+## Extending a container image
 
-You can extend the `mcp-proxy` container image to include additional executables or
-configure the bundled `uv`. For example, this image restricts `uv` to the system Python:
+The `debian-node` flavor includes Node.js, `npm`, and `npx`. For other
+operating-system packages, extend a flavor with that distribution's package
+manager. Keep Python virtual environments on the same libc family as their
+build stage.
 
 ```Dockerfile
 # file: mcp-proxy.Dockerfile
 
-FROM ghcr.io/sparfenyuk/mcp-proxy:latest
+FROM ghcr.io/sparfenyuk/mcp-proxy:vX.Y.Z-alpine
 
+RUN apk add --no-cache curl
 ENV UV_PYTHON_PREFERENCE=only-system
 ```
+
+Build and run the custom image:
+
+```bash
+docker build -f mcp-proxy.Dockerfile -t mcp-proxy-custom .
+docker run --rm -p 127.0.0.1:8080:8080 mcp-proxy-custom \
+  --host=0.0.0.0 --port=8080 --allowed-host 127.0.0.1:8080 \
+  -- uvx mcp-server-fetch
+```
+
+The first `uvx` or `npx` launch needs network access to download a package that is not already cached.
+When exposing the proxy beyond a local test, continue to configure `--allowed-host`
+and allowed origins for the client-facing address. `--pass-environment` controls
+which host environment values reach spawned server processes; use it only when needed.
 
 To check a locally built image, run the opt-in container tests:
 
 ```bash
-docker build -t mcp-proxy:test .
-MCP_PROXY_TEST_IMAGE=mcp-proxy:test uv run --frozen pytest -q tests/test_container_image.py
+docker build -t mcp-proxy:flavors-alpine .
+MCP_PROXY_TEST_IMAGE=mcp-proxy:flavors-alpine MCP_PROXY_TEST_FLAVOR=alpine uv run --frozen pytest -q tests/test_container_image.py
+
+docker build -f Dockerfile.debian --target debian -t mcp-proxy:flavors-debian .
+MCP_PROXY_TEST_IMAGE=mcp-proxy:flavors-debian MCP_PROXY_TEST_FLAVOR=debian uv run --frozen pytest -q tests/test_container_image.py
+
+docker build -f Dockerfile.debian --target debian-node -t mcp-proxy:flavors-debian-node .
+MCP_PROXY_TEST_IMAGE=mcp-proxy:flavors-debian-node MCP_PROXY_TEST_FLAVOR=debian-node uv run --frozen pytest -q tests/test_container_image.py
 ```
 
-These tests disable container network access, run a local wheel through `uvx`, and
-launch an MCP server through `uv` to list and call a tool through the proxy.
-Without `MCP_PROXY_TEST_IMAGE`, the container tests are skipped.
+These tests disable container network access, run a local wheel through `uvx`,
+launch an MCP server through `uv`, and exercise a local `npx` package. Flavor
+checks are skipped when `MCP_PROXY_TEST_FLAVOR` is unset; all container tests
+are skipped when `MCP_PROXY_TEST_IMAGE` is unset.
 
 ## Docker Compose Setup
 

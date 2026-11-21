@@ -3,6 +3,7 @@
 This server is created independent of any transport mechanism.
 """
 
+import json
 import logging
 import typing as t
 
@@ -16,6 +17,25 @@ from .structured_content import enrich_call_tool_result
 
 logger = logging.getLogger(__name__)
 CANCELLATION_FORWARD_TIMEOUT_SECONDS = 5.0
+
+
+def _with_structured_content_text(result: types.CallToolResult) -> types.CallToolResult:
+    if result.structuredContent is not None and not any(
+        isinstance(content, types.TextContent) and content.text.strip()
+        for content in result.content
+    ):
+        return result.model_copy(
+            update={
+                "content": [
+                    *result.content,
+                    types.TextContent(
+                        type="text",
+                        text=json.dumps(result.structuredContent, indent=2),
+                    ),
+                ],
+            },
+        )
+    return result
 
 
 async def create_proxy_server(remote_app: ClientSession) -> server.Server[object]:  # noqa: C901, PLR0915
@@ -168,7 +188,7 @@ async def create_proxy_server(remote_app: ClientSession) -> server.Server[object
                                 logger.warning("Unable to forward MCP tool cancellation")
                     raise
                 enrich_call_tool_result(req.params.name, result)
-                return types.ServerResult(result)
+                return types.ServerResult(_with_structured_content_text(result))
             except Exception as e:  # noqa: BLE001
                 return types.ServerResult(
                     types.CallToolResult(

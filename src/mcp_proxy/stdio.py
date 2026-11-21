@@ -129,13 +129,17 @@ class _ReleasingInput(ObjectReceiveStream[SessionMessage | Exception]):
 
 
 @asynccontextmanager
-async def stdio_client_lifespan() -> AsyncIterator[
+async def stdio_client_lifespan(
+    *,
+    graceful_eof_ready: anyio.Event | None = None,
+    graceful_eof_observed: anyio.Event | None = None,
+) -> AsyncIterator[
     tuple[
         MemoryObjectReceiveStream[SessionMessage | Exception],
         MemoryObjectSendStream[SessionMessage],
     ]
 ]:
-    """Cancel remote work on stdin EOF, including connection and initialization."""
+    """Cancel startup on EOF, but let an initialized reverse client drain cleanly."""
     budget = _InputBudget()
     stdin_file = _DaemonStdin(_BoundedLines(sys.stdin.fileno()), budget)
     async with (
@@ -150,7 +154,12 @@ async def stdio_client_lifespan() -> AsyncIterator[
             async with sender:
                 async for message in stdin:
                     sender.send_nowait((message, budget.sizes.popleft()))
-            tasks.cancel_scope.cancel()
+            # Once a running proxy can consume stream EOF, let its transport
+            # close normally. Cancellation during startup must remain immediate.
+            if graceful_eof_ready is None or not graceful_eof_ready.is_set():
+                tasks.cancel_scope.cancel()
+            elif graceful_eof_observed is not None:
+                graceful_eof_observed.set()
 
         async with _ReleasingInput(receiver, budget) as read_stream:
             tasks.start_soon(forward_stdin)

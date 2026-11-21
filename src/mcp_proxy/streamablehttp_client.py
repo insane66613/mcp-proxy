@@ -3,7 +3,7 @@
 """Expose a remote Streamable HTTP server over local MCP stdio."""
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from functools import partial
 from typing import Any, cast
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Only session termination receives this bound. Normal tool calls and
 # long-lived GET streams retain the SDK's configured request/read timeouts.
 SESSION_TERMINATION_TIMEOUT_SECONDS = 5.0
+_EOF_DRAIN_GRACE_SECONDS = 2.0
 _SESSION_TERMINATION_DEADLINE_EXTENSION = "mcp_proxy.session_termination_deadline"
 
 
@@ -96,6 +97,40 @@ def _session_httpx_client_factory(
     client.event_hooks.setdefault("response", []).append(observer.observe)
     return client
 
+
+async def _run_with_bounded_eof(
+    run: Callable[[], Awaitable[None]], eof_observed: anyio.Event
+) -> None:
+    """Cancel stuck local work after EOF without cancelling transport disposal."""
+    finished = anyio.Event()
+    application_error: Exception | None = None
+    # Keep the application cancel scope inside the upstream session lifetime.
+    # Exiting this scope first gives the session's bounded DELETE a chance to run.
+    with anyio.CancelScope() as app_scope:
+        async with anyio.create_task_group() as watcher:
+
+            async def watch_eof() -> None:
+                await eof_observed.wait()
+                with anyio.move_on_after(_EOF_DRAIN_GRACE_SECONDS):
+                    await finished.wait()
+                if not finished.is_set():
+                    logger.warning(
+                        "Reverse-client stdin EOF drain expired; cancelling local requests"
+                    )
+                    app_scope.cancel()
+
+            watcher.start_soon(watch_eof)
+            try:
+                await run()
+            except Exception as exc:  # noqa: BLE001 - preserve the original application error
+                application_error = exc
+            finally:
+                finished.set()
+                watcher.cancel_scope.cancel()
+    if application_error is not None:
+        raise application_error
+
+
 async def run_streamablehttp_client(
     url: str,
     headers: dict[str, Any] | None = None,
@@ -129,13 +164,20 @@ async def run_streamablehttp_client(
         ):
             yield session
 
+    graceful_eof_ready = anyio.Event()
+    graceful_eof_observed = anyio.Event()
     async with (
-        stdio_client_lifespan() as (read_stream, write_stream),
+        stdio_client_lifespan(
+            graceful_eof_ready=graceful_eof_ready,
+            graceful_eof_observed=graceful_eof_observed,
+        ) as (read_stream, write_stream),
         ReconnectingClientSession(connect) as session,
     ):
         app = await create_proxy_server(cast("ClientSession", session))
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options(),
-        )
+        # The receive stream retains EOF even if stdin closes just before run starts.
+        graceful_eof_ready.set()
+
+        async def run_app() -> None:
+            await app.run(read_stream, write_stream, app.create_initialization_options())
+
+        await _run_with_bounded_eof(run_app, graceful_eof_observed)

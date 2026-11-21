@@ -55,18 +55,40 @@ def _install_mock_transport(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delete_mode", ["headers", "body", "immediate"])
+@pytest.mark.parametrize(
+    ("delete_mode", "pending_tool", "reconnect"),
+    [
+        ("headers", False, False),
+        ("headers", True, False),
+        ("body", False, False),
+        ("body", True, False),
+        ("immediate", False, False),
+        ("immediate", True, False),
+        ("immediate", True, True),
+    ],
+)
+@pytest.mark.parametrize("shutdown_method", ["eof"] if os.name == "nt" else ["sigint", "eof"])
 @pytest.mark.skipif(
     sys.version_info < (3, 11),
     reason="asyncio.run handles SIGINT gracefully starting with Python 3.11",
 )
 async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  # noqa: C901, PLR0912, PLR0915
     delete_mode: str,
+    pending_tool: bool,
+    reconnect: bool,
+    shutdown_method: str,
 ) -> None:
     """A real stdio CLI bounds DELETE teardown and preserves SIGINT."""
     session_id = "cli-delete-body-session"
     delete_entered = asyncio.Event()
+    delete_calls = 0
+    delete_by_session: dict[str, int] = {}
+    generations = 0
+    current_session_id = session_id
+    losses = 0
     release_delete = asyncio.Event()
+    tool_entered = asyncio.Event()
+    release_tool = asyncio.Event()
     responses: dict[int, dict[str, Any]] = {}
     response_available = asyncio.Event()
     source_file = _SOURCE_FILE
@@ -84,6 +106,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        nonlocal current_session_id, delete_calls, generations, losses
         task = asyncio.current_task()
         if task is not None:
             handlers.add(task)
@@ -100,13 +123,24 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
             body = await reader.readexactly(int(headers.get("content-length", "0")))
             message = json.loads(body) if body else {}
             rpc_method = message.get("method")
+            if rpc_method == "tools/call" and pending_tool:
+                tool_entered.set()
+                await release_tool.wait()
 
-            if method == "GET":
+            if reconnect and rpc_method == "tools/list" and generations == 1 and losses == 0:
+                losses += 1
+                writer.write(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+            elif method == "GET":
                 writer.write(
                     b"HTTP/1.1 405 Method Not Allowed\r\n"
                     b"Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
             elif method == "DELETE":
+                delete_calls += 1
+                seen_session = headers.get("mcp-session-id", "")
+                delete_by_session[seen_session] = delete_by_session.get(seen_session, 0) + 1
                 delete_entered.set()
                 if delete_mode == "headers":
                     await release_delete.wait()
@@ -130,6 +164,8 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 )
             else:
                 if rpc_method == "initialize":
+                    generations += 1
+                    current_session_id = f"{session_id}-{generations}" if reconnect else session_id
                     result: dict[str, Any] = {
                         "protocolVersion": message["params"]["protocolVersion"],
                         "capabilities": {"tools": {}},
@@ -141,7 +177,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                         "result": result,
                     }
                     extra_headers = (
-                        f"Mcp-Session-Id: {session_id}\r\n"
+                        f"Mcp-Session-Id: {current_session_id}\r\n"
                         f"Mcp-Protocol-Version: {result['protocolVersion']}\r\n"
                     )
                 elif rpc_method == "tools/list":
@@ -246,7 +282,14 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         await wait_response(1)
         await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         await send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        await wait_response(2)
+        first_list = await wait_response(2)
+        if reconnect:
+            assert "error" in first_list, first_list
+            await send({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
+            recovered = await wait_response(4)
+            assert "result" in recovered, recovered
+        else:
+            assert "result" in first_list, first_list
         await send(
             {
                 "jsonrpc": "2.0",
@@ -255,11 +298,13 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 "params": {"name": "echo", "arguments": {}},
             }
         )
-        await wait_response(3)
+        if pending_tool:
+            await asyncio.wait_for(tool_entered.wait(), timeout=5)
+        else:
+            await wait_response(3)
         sigint_at = time.monotonic()
-        if os.name == "nt":
-            # Headless Windows subprocesses cannot receive POSIX SIGINT.
-            # Closing both stdin handles exercises the native MCP stdio EOF shutdown.
+        if shutdown_method == "eof":
+            # Windows and POSIX both exercise native stdin EOF shutdown.
             process.stdin.close()
             os.close(retained_writer)
             retained_writer = -1
@@ -271,7 +316,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         except (TimeoutError, asyncio.TimeoutError):
             pass
         try:
-            await asyncio.wait_for(process.wait(), timeout=6.5)
+            await asyncio.wait_for(process.wait(), timeout=9.5 if pending_tool else 6.5)
             exited_within_deadline = True
             if retained_writer >= 0:
                 os.fstat(retained_writer)
@@ -280,6 +325,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 os.fstat(retained_writer)
     finally:
         release_delete.set()
+        release_tool.set()
         if process.returncode is None:
             try:
                 await asyncio.wait_for(process.wait(), timeout=5)
@@ -301,11 +347,22 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 await asyncio.gather(*pending, return_exceptions=True)
 
     assert delete_observed, f"CLI did not issue DELETE on shutdown: {stderr!r}"
+    if reconnect:
+        assert generations == 2, generations
+        assert losses == 1, losses
+        generation_a, generation_b = f"{session_id}-1", f"{session_id}-2"
+        assert set(delete_by_session) <= {generation_a, generation_b}, delete_by_session
+        assert delete_by_session.get(generation_a, 0) <= 1, delete_by_session
+        assert delete_by_session.get(generation_b, 0) == 1, delete_by_session
+        assert delete_calls == delete_by_session.get(generation_a, 0) + 1
+    else:
+        assert delete_by_session == {session_id: 1}, delete_by_session
+        assert delete_calls == 1, f"Expected one DELETE, observed {delete_calls}"
     assert exited_within_deadline, "CLI remained blocked past the five-second DELETE deadline"
     assert sigint_at is not None
     elapsed = time.monotonic() - sigint_at
-    assert elapsed < (3 if delete_mode == "immediate" else 6.5)
-    if os.name == "nt":
+    assert elapsed < (9.5 if pending_tool else (3 if delete_mode == "immediate" else 6.5))
+    if shutdown_method == "eof":
         assert process.returncode == 0, stderr
     else:
         assert process.returncode != 0

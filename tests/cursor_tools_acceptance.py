@@ -1,5 +1,7 @@
 """Read-only production-parity acceptance for Cursor Commander proxy."""
 
+# ruff: noqa: T201 - CLI-only evidence receipts are printed intentionally.
+
 import asyncio
 import sys
 
@@ -8,6 +10,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 
 async def main() -> None:
+    """Check a scoped Cursor Commander MCP endpoint without mutations."""
     async with (
         streamablehttp_client(
             sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18766/mcp/"
@@ -17,7 +20,8 @@ async def main() -> None:
         await session.initialize()
         tools = await session.list_tools()
         names = {tool.name for tool in tools.tools}
-        assert len(names) == 8
+        expected_tool_count = 8
+        assert len(names) == expected_tool_count
         assert {"cursor_dashboard", "cursor_chatgpt_claim", "cursor_chatgpt_reply"} <= names
         dashboard = await session.call_tool("cursor_dashboard", {})
         assert not dashboard.isError

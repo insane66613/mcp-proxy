@@ -1,6 +1,7 @@
 """Create a local SSE server that proxies requests to a stdio MCP server."""
 
 import contextlib
+import hmac
 import json
 import logging
 import math
@@ -20,6 +21,7 @@ from mcp.server import Server as MCPServerSDK  # Renamed to avoid conflict
 from mcp.server.sse import SseServerTransport
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
+from mcp.shared.exceptions import McpError
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -45,6 +47,9 @@ _MAX_PORT: Final[int] = 65535
 _HTTP_DEFAULT_PORT: Final[int] = 80
 _HOST_REJECTION_STATUS: Final[int] = 421
 _ORIGIN_REJECTION_STATUS: Final[int] = 403
+_BEARER_TOKEN_CHARS: Final[bytes] = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~+/"
+)
 
 
 def _default_expose_headers() -> list[str]:
@@ -66,6 +71,24 @@ class MCPServerSettings:
     session_idle_timeout: float = 1800.0
     access_log: bool = True
     streamable_http_get: bool = True
+    auth_bearer_token: str | None = None
+
+
+def _valid_bearer_token_bytes(token: bytes) -> bool:
+    token_chars, separator, padding = token.partition(b"=")
+    return (
+        bool(token_chars)
+        and all(character in _BEARER_TOKEN_CHARS for character in token_chars)
+        and (not separator or all(character == ord("=") for character in padding))
+    )
+
+
+def _valid_bearer_token(token: str) -> bool:
+    try:
+        token_bytes = token.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return _valid_bearer_token_bytes(token_bytes)
 
 
 def _has_whitespace_or_control(value: str) -> bool:
@@ -294,6 +317,44 @@ class _TransportSecurityAdapter:
         return None
 
 
+class _BearerAuthMiddleware:
+    """Require one valid shared Bearer credential on every HTTP request."""
+
+    def __init__(
+        self,
+        app: Callable[[Scope, Receive, Send], Awaitable[None]],
+        token: str,
+    ) -> None:
+        self.app = app
+        self.token = token.encode("ascii")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        authorization = [
+            value for name, value in scope.get("headers", []) if name.lower() == b"authorization"
+        ]
+        if len(authorization) != 1 or not self._matches(authorization[0]):
+            response = Response(
+                "" if scope["method"] == "HEAD" else "Unauthorized",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Bearer realm="mcp-proxy"'},
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+    def _matches(self, authorization: bytes) -> bool:
+        scheme, separator, token = authorization.partition(b" ")
+        if scheme.lower() != b"bearer" or not separator:
+            return False
+        token = token.lstrip(b" ")
+        return _valid_bearer_token_bytes(token) and hmac.compare_digest(token, self.token)
+
+
 # To store last activity for multiple servers if needed, though status endpoint is global for now.
 _global_status: dict[str, Any] = {
     "api_last_activity": datetime.now(timezone.utc).isoformat(),
@@ -391,7 +452,7 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                     )
                 finally:
                     _global_status["active_sse_connections"] -= 1
-        except Exception:
+        except Exception:  # noqa: BLE001 - response is already streaming
             # SSE response already started — cannot send HTTP error response.
             # Log and let the connection close gracefully.
             logger.warning(
@@ -630,15 +691,36 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
 
 
 class _StdioExitWatch:
-    """Stop the proxy when a stdio server exits, so it exits non-zero and can be restarted."""
+    """Stop the proxy only when an active stdio server exits."""
 
     def __init__(self) -> None:
         self.http_server: uvicorn.Server | None = None
-        self.exited: list[str] = []
+        self.exited: set[str | None] = set()
+        self.starting: set[str | None] = set()
+        self.startup_exited: set[str | None] = set()
+        self.active: set[str | None] = set()
+        self.closing: set[str | None] = set()
+        self.startup_cancel_scope: anyio.CancelScope | None = None
+        self.startup_stage = "spawn"
+
+    def begin(self, identity: str | None) -> None:
+        self.starting.add(identity)
+        self.startup_exited.discard(identity)
+        self.startup_stage = "spawn"
+
+    def activate(self, identity: str | None) -> None:
+        if identity in self.startup_exited:
+            raise _StdioCandidateExitedError
+        self.starting.discard(identity)
+        self.active.add(identity)
+
+    def abandon(self, identity: str | None) -> None:
+        self.starting.discard(identity)
+        self.startup_exited.discard(identity)
 
     @contextlib.asynccontextmanager
     async def client(
-        self, params: StdioServerParameters, name: str
+        self, params: StdioServerParameters, identity: str | None
     ) -> AsyncIterator[tuple[Any, Any]]:
         """Forward stdio with zero buffering so EOF also stops an idle HTTP proxy."""
         async with stdio_client(params) as (read_stream, write_stream):
@@ -651,22 +733,35 @@ class _StdioExitWatch:
                             await send.send(message)
                     except anyio.BrokenResourceError:
                         return  # the session stopped reading: we are shutting down
-                self._on_exit(name)
+                self._on_exit(identity)
 
             async with anyio.create_task_group() as tg:
                 tg.start_soon(forward)
-                yield receive, write_stream
-                tg.cancel_scope.cancel()
+                try:
+                    yield receive, write_stream
+                finally:
+                    self.closing.add(identity)
+                    tg.cancel_scope.cancel()
 
-    def _on_exit(self, name: str) -> None:
-        if self.http_server is not None and self.http_server.should_exit:
+    def _on_exit(self, identity: str | None) -> None:
+        if identity in self.closing or (
+            self.http_server is not None and self.http_server.should_exit
+        ):
             return  # already shutting down (e.g. Ctrl+C), which stops the stdio server too
-        logger.error("Stdio server '%s' exited, shutting down", name)
-        self.exited.append(name)
+        if identity in self.starting:
+            self.startup_exited.add(identity)
+            return
+        if identity not in self.active:
+            return
+        display_name = "default" if identity is None else identity
+        logger.error("Stdio server '%s' exited, shutting down", display_name)
+        self.exited.add(identity)
         if self.http_server is not None:
             self.http_server.should_exit = True
             # Don't let a client's open connection keep a proxy with a dead server running.
             self.http_server.config.timeout_graceful_shutdown = 5
+        elif self.startup_cancel_scope is not None:
+            self.startup_cancel_scope.cancel()
 
     def attach(self, http_server: uvicorn.Server) -> None:
         """Stop this server when a stdio server exits, or right away if one already has."""
@@ -686,62 +781,138 @@ async def _prepare_stdio_server_routes(
     stdio_exit: _StdioExitWatch,
     params: StdioServerParameters,
     settings: MCPServerSettings,
-    name: str,
+    identity: str | None,
 ) -> list[BaseRoute]:
-    """Prepare one stdio backend and register its lifetimes on the shared stack."""
-    stdio_streams = await stack.enter_async_context(stdio_exit.client(params, name))
+    """Prepare one stdio backend and register its lifetimes on the supplied stack."""
+    stdio_exit.begin(identity)
+    stdio_streams = await stack.enter_async_context(stdio_exit.client(params, identity))
+    stdio_exit.startup_stage = "session"
     session = await stack.enter_async_context(ClientSession(*stdio_streams))
+    stdio_exit.startup_stage = "initialize"
     with anyio.fail_after(settings.initialization_timeout):
         proxy = await create_proxy_server(session)
 
+    stdio_exit.startup_stage = "routes"
     instance_routes, http_manager = create_single_instance_routes(
         proxy,
         stateless_instance=settings.stateless,
         session_idle_timeout=settings.session_idle_timeout,
         streamable_http_get=settings.streamable_http_get,
     )
+    stdio_exit.startup_stage = "manager"
     await stack.enter_async_context(http_manager.run())
+    stdio_exit.activate(identity)
     return instance_routes
 
 
-def _log_sse_urls(
+class _StdioCandidateExitedError(Exception):
+    """A stdio process closed before its startup attempt was activated."""
+
+
+class _StdioStartupFailureError(Exception):
+    """A named stdio backend failed at a supported startup boundary."""
+
+    def __init__(self, category: str) -> None:
+        super().__init__(category)
+        self.category = category
+
+
+def _named_startup_failure_category(error: BaseException, stage: str) -> str | None:
+    if isinstance(error, _StdioCandidateExitedError):
+        return "child exited during startup"
+    if stage == "spawn" and isinstance(error, OSError) and not isinstance(error, TimeoutError):
+        return "spawn"
+    if stage == "initialize":
+        if isinstance(error, TimeoutError):
+            return "initialization timeout"
+        if isinstance(error, McpError):
+            return "initialization"
+    return None
+
+
+async def _prepare_named_stdio_server_routes(
+    stack: contextlib.AsyncExitStack,
+    stdio_exit: _StdioExitWatch,
+    params: StdioServerParameters,
+    settings: MCPServerSettings,
+    name: str,
+) -> list[BaseRoute]:
+    """Prepare a named backend privately and transfer its exits only on success."""
+    attempt_stack = contextlib.AsyncExitStack()
+    try:
+        instance_routes = await _prepare_stdio_server_routes(
+            attempt_stack,
+            stdio_exit,
+            params,
+            settings,
+            name,
+        )
+    except BaseException as error:
+        try:
+            await attempt_stack.aclose()
+        finally:
+            stdio_exit.abandon(name)
+        category = _named_startup_failure_category(error, stdio_exit.startup_stage)
+        if category is not None:
+            raise _StdioStartupFailureError(category) from None
+        raise
+    stack.push_async_exit(attempt_stack.pop_all())
+    return instance_routes
+
+
+def _log_server_urls(
     settings: MCPServerSettings,
     default_server_params: StdioServerParameters | None,
-    named_server_params: dict[str, StdioServerParameters],
+    active_named_server_params: dict[str, StdioServerParameters],
 ) -> None:
-    """Log the SSE endpoints for each configured backend."""
-    base_url = f"http://{settings.bind_host}:{settings.port}"
-    sse_urls = []
+    """Log the SSE and StreamableHTTP endpoints for active backends."""
+    dynamic_port = settings.port == 0
+    base_url = (
+        ""
+        if dynamic_port
+        else f"http://{_bracket_host(settings.bind_host.strip('[]'))}:{settings.port}"
+    )
+    prefixes = [""] if default_server_params else []
+    prefixes.extend(f"/servers/{name}" for name in active_named_server_params)
+    if not prefixes:
+        return
 
-    if default_server_params:
-        sse_urls.append(f"{base_url}/sse")
-    sse_urls.extend([f"{base_url}/servers/{name}/sse" for name in named_server_params])
+    if dynamic_port:
+        logger.info(
+            "The server is using an ephemeral port; combine these endpoint paths "
+            "with the Uvicorn listening address."
+        )
 
-    if sse_urls:
-        logger.info("Serving MCP Servers via SSE:")
-        for url in sse_urls:
-            logger.info("  - %s", url)
-
-
-async def run_mcp_server(
-    mcp_settings: MCPServerSettings,
-    default_server_params: StdioServerParameters | None = None,
-    named_server_params: dict[str, StdioServerParameters] | None = None,
-) -> None:
-    """Run stdio client(s) and expose an MCP server with multiple possible backends."""
-    if mcp_settings.initialization_timeout is not None and (
-        not math.isfinite(mcp_settings.initialization_timeout)
-        or mcp_settings.initialization_timeout <= 0
+    for header, path in (
+        ("Serving MCP Servers via SSE:", "/sse"),
+        ("Serving MCP Servers via StreamableHTTP:", "/mcp"),
     ):
-        raise ValueError("initialization_timeout must be a finite number greater than zero")
+        logger.info(header)
+        for prefix in prefixes:
+            logger.info("  - %s", f"{base_url}{prefix}{path}")
 
-    security_settings = _create_transport_security_settings(mcp_settings)
-    named_server_params = {} if named_server_params is None else named_server_params
 
-    stdio_exit = _StdioExitWatch()
+def _server_status_key(identity: str | None, has_default_name_collision: bool) -> str:
+    if has_default_name_collision:
+        return "/" if identity is None else f"/servers/{identity}"
+    return "default" if identity is None else identity
+
+
+async def _serve_mcp_server(
+    mcp_settings: MCPServerSettings,
+    default_server_params: StdioServerParameters | None,
+    named_server_params: dict[str, StdioServerParameters],
+    security_settings: TransportSecuritySettings,
+    stdio_exit: _StdioExitWatch,
+) -> None:
+    """Acquire backends, then serve only routes for successfully prepared instances."""
     all_routes: list[BaseRoute] = [
         Route("/status", endpoint=_handle_status),  # Global status endpoint
     ]
+    active_named_server_params: dict[str, StdioServerParameters] = {}
+    has_default_name_collision = (
+        default_server_params is not None and "default" in named_server_params
+    )
     # Use AsyncExitStack to manage lifecycles of multiple components
     async with contextlib.AsyncExitStack() as stack:
         # Manage lifespans of all StreamableHTTPSessionManagers
@@ -764,35 +935,46 @@ async def run_mcp_server(
                 stdio_exit,
                 default_server_params,
                 mcp_settings,
-                "default",
+                None,
             )
             all_routes.extend(instance_routes)
-            _global_status["server_instances"]["default"] = "configured"
+            default_status_key = _server_status_key(None, has_default_name_collision)
+            _global_status["server_instances"][default_status_key] = "configured"
 
         # Setup named servers
         for name, params in named_server_params.items():
+            status_key = _server_status_key(name, has_default_name_collision)
             logger.info(
                 "Setting up named server '%s': %s %s",
                 name,
                 params.command,
                 " ".join(params.args),
             )
-            instance_routes_named = await _prepare_stdio_server_routes(
-                stack,
-                stdio_exit,
-                params,
-                mcp_settings,
-                name,
-            )
+            try:
+                instance_routes_named = await _prepare_named_stdio_server_routes(
+                    stack,
+                    stdio_exit,
+                    params,
+                    mcp_settings,
+                    name,
+                )
+            except _StdioStartupFailureError as error:
+                _global_status["server_instances"][status_key] = "failed"
+                logger.warning("Skipping named server '%s' after %s", name, error.category)
+                continue
 
             # Mount these routes under /servers/<name>/
             server_mount = Mount(f"/servers/{name}", routes=instance_routes_named)
             all_routes.append(server_mount)
-            _global_status["server_instances"][name] = "configured"
+            active_named_server_params[name] = params
+            _global_status["server_instances"][status_key] = "configured"
 
         if not default_server_params and not named_server_params:
             logger.error("No servers configured to run.")
             return
+        if not default_server_params and not active_named_server_params:
+            logger.error("No named servers could be started.")
+            sys.exit(1)
 
         middleware: list[Middleware] = []
         if mcp_settings.allow_origins:
@@ -804,6 +986,10 @@ async def run_mcp_server(
                     allow_headers=["*"],
                     expose_headers=mcp_settings.expose_headers,
                 ),
+            )
+        if mcp_settings.auth_bearer_token is not None:
+            middleware.append(
+                Middleware(_BearerAuthMiddleware, token=mcp_settings.auth_bearer_token),
             )
 
         starlette_app = Starlette(
@@ -832,7 +1018,7 @@ async def run_mcp_server(
         http_server = uvicorn.Server(config)
         stdio_exit.attach(http_server)
 
-        _log_sse_urls(mcp_settings, default_server_params, named_server_params)
+        _log_server_urls(mcp_settings, default_server_params, active_named_server_params)
 
         logger.debug(
             "Serving incoming MCP requests on %s:%s",
@@ -840,5 +1026,37 @@ async def run_mcp_server(
             mcp_settings.port,
         )
         await http_server.serve()
+
+
+async def run_mcp_server(
+    mcp_settings: MCPServerSettings,
+    default_server_params: StdioServerParameters | None = None,
+    named_server_params: dict[str, StdioServerParameters] | None = None,
+) -> None:
+    """Run stdio client(s) and expose an MCP server with multiple possible backends."""
+    if mcp_settings.auth_bearer_token is not None and not _valid_bearer_token(
+        mcp_settings.auth_bearer_token,
+    ):
+        raise ValueError("auth_bearer_token must be a valid non-empty RFC 6750 b64token")
+
+    if mcp_settings.initialization_timeout is not None and (
+        not math.isfinite(mcp_settings.initialization_timeout)
+        or mcp_settings.initialization_timeout <= 0
+    ):
+        raise ValueError("initialization_timeout must be a finite number greater than zero")
+
+    security_settings = _create_transport_security_settings(mcp_settings)
+    named_server_params = {} if named_server_params is None else named_server_params
+    stdio_exit = _StdioExitWatch()
+
+    with anyio.CancelScope() as startup_cancel_scope:
+        stdio_exit.startup_cancel_scope = startup_cancel_scope
+        await _serve_mcp_server(
+            mcp_settings,
+            default_server_params,
+            named_server_params,
+            security_settings,
+            stdio_exit,
+        )
 
     stdio_exit.exit_if_exited()

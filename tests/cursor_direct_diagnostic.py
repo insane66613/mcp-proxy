@@ -1,5 +1,7 @@
 """Read-only Cursor Commander direct stdio parity diagnostic."""
 
+# ruff: noqa: T201 - CLI-only evidence receipts are printed intentionally.
+
 import asyncio
 import hashlib
 
@@ -10,7 +12,8 @@ COMMAND = r"X:\Code\cursor-commander\.venv\Scripts\cursor-commander.exe"
 ROOT = r"X:\Code\cursor-commander"
 
 
-async def main():
+async def main() -> None:
+    """Print direct-stdio tool-list evidence for operator inspection."""
     params = StdioServerParameters(command=COMMAND, args=["mcp"], cwd=ROOT, env={})
     async with stdio_client(params) as (reader, writer):  # noqa: SIM117
         async with ClientSession(reader, writer) as session:
