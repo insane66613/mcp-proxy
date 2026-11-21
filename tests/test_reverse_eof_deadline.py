@@ -156,3 +156,52 @@ async def test_external_cancellation_is_not_swallowed() -> None:
             await started.wait()
             tasks.cancel_scope.cancel()
     assert propagated.is_set()
+
+
+@pytest.mark.asyncio
+async def test_application_cleanup_failure_after_eof_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure in cancellation cleanup must not be swallowed as normal EOF."""
+    monkeypatch.setattr(reverse_client, "_EOF_DRAIN_GRACE_SECONDS", 0.025)
+    eof = anyio.Event()
+    running = anyio.Event()
+    failure = RuntimeError("cleanup failed on EOF cancellation")
+
+    async def stuck() -> None:
+        running.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            raise failure
+
+    async def close_stdin() -> None:
+        await running.wait()
+        eof.set()
+
+    with anyio.fail_after(2):
+        async with anyio.create_task_group() as controller:
+            controller.start_soon(close_stdin)
+            with pytest.raises(RuntimeError, match="cleanup failed") as exc:
+                await reverse_client._run_with_bounded_eof(stuck, eof)
+            assert exc.value is failure
+
+
+@pytest.mark.asyncio
+async def test_watcher_failure_is_not_silenced() -> None:
+    """Unexpected EOF observer errors remain visible to incident diagnostics."""
+
+    class BrokenEOF:
+        async def wait(self) -> None:
+            raise RuntimeError("observer failed")
+
+    async def blocked() -> None:
+        await anyio.sleep_forever()
+
+    with anyio.fail_after(2):
+        with pytest.raises(Exception, match="unhandled errors") as captured:
+            await reverse_client._run_with_bounded_eof(blocked, BrokenEOF())  # type: ignore[arg-type]
+    errors = getattr(captured.value, "exceptions", ())
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "observer failed"
