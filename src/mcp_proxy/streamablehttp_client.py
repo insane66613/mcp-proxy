@@ -96,6 +96,7 @@ def _session_httpx_client_factory(
     client.event_hooks.setdefault("response", []).append(observer.observe)
     return client
 
+
 async def run_streamablehttp_client(
     url: str,
     headers: dict[str, Any] | None = None,
@@ -129,11 +130,13 @@ async def run_streamablehttp_client(
         ):
             yield session
 
+    graceful_eof_ready = anyio.Event()
     async with (
-        stdio_client_lifespan() as (read_stream, write_stream),
+        stdio_client_lifespan(graceful_eof_ready=graceful_eof_ready) as (read_stream, write_stream),
         ReconnectingClientSession(connect) as session,
     ):
         app = await create_proxy_server(cast("ClientSession", session))
+        graceful_eof_ready.set()
         await app.run(
             read_stream,
             write_stream,
