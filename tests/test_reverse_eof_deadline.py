@@ -122,16 +122,14 @@ async def test_eof_before_application_consumes_stream_is_retained(
 async def test_non_cancelled_application_error_is_preserved() -> None:
     """A real run failure must not be mistaken for an EOF timeout."""
     eof = anyio.Event()
+    original = ValueError("synthetic run failure")
 
     async def fail() -> None:
-        raise ValueError("synthetic run failure")
+        raise original
 
-    with pytest.raises(Exception, match="unhandled errors") as failure:
+    with pytest.raises(ValueError, match="synthetic run failure") as failure:
         await reverse_client._run_with_bounded_eof(fail, eof)
-    errors = getattr(failure.value, "exceptions", ())
-    assert len(errors) == 1
-    assert isinstance(errors[0], ValueError)
-    assert str(errors[0]) == "synthetic run failure"
+    assert failure.value is original
 
 
 @pytest.mark.asyncio

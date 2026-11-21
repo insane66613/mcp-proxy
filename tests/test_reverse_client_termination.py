@@ -57,6 +57,7 @@ def _install_mock_transport(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delete_mode", ["headers", "body", "immediate"])
 @pytest.mark.parametrize("pending_tool", [False, True])
+@pytest.mark.parametrize("shutdown_method", ["eof"] if os.name == "nt" else ["sigint", "eof"])
 @pytest.mark.skipif(
     sys.version_info < (3, 11),
     reason="asyncio.run handles SIGINT gracefully starting with Python 3.11",
@@ -64,10 +65,12 @@ def _install_mock_transport(
 async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  # noqa: C901, PLR0912, PLR0915
     delete_mode: str,
     pending_tool: bool,
+    shutdown_method: str,
 ) -> None:
     """A real stdio CLI bounds DELETE teardown and preserves SIGINT."""
     session_id = "cli-delete-body-session"
     delete_entered = asyncio.Event()
+    delete_calls = 0
     release_delete = asyncio.Event()
     tool_entered = asyncio.Event()
     release_tool = asyncio.Event()
@@ -88,6 +91,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        nonlocal delete_calls
         task = asyncio.current_task()
         if task is not None:
             handlers.add(task)
@@ -114,6 +118,7 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                     b"Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
             elif method == "DELETE":
+                delete_calls += 1
                 delete_entered.set()
                 if delete_mode == "headers":
                     await release_delete.wait()
@@ -267,9 +272,8 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
         else:
             await wait_response(3)
         sigint_at = time.monotonic()
-        if os.name == "nt":
-            # Headless Windows subprocesses cannot receive POSIX SIGINT.
-            # Closing both stdin handles exercises the native MCP stdio EOF shutdown.
+        if shutdown_method == "eof":
+            # Windows and POSIX both exercise native stdin EOF shutdown.
             process.stdin.close()
             os.close(retained_writer)
             retained_writer = -1
@@ -312,11 +316,12 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
                 await asyncio.gather(*pending, return_exceptions=True)
 
     assert delete_observed, f"CLI did not issue DELETE on shutdown: {stderr!r}"
+    assert delete_calls == 1, f"Expected one DELETE, observed {delete_calls}"
     assert exited_within_deadline, "CLI remained blocked past the five-second DELETE deadline"
     assert sigint_at is not None
     elapsed = time.monotonic() - sigint_at
     assert elapsed < (9.5 if pending_tool else (3 if delete_mode == "immediate" else 6.5))
-    if os.name == "nt":
+    if shutdown_method == "eof":
         assert process.returncode == 0, stderr
     else:
         assert process.returncode != 0

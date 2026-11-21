@@ -103,6 +103,7 @@ async def _run_with_bounded_eof(
 ) -> None:
     """Cancel stuck local work after EOF without cancelling transport disposal."""
     finished = anyio.Event()
+    application_error: Exception | None = None
     # Keep the application cancel scope inside the upstream session lifetime.
     # Exiting this scope first gives the session's bounded DELETE a chance to run.
     with anyio.CancelScope() as app_scope:
@@ -121,9 +122,13 @@ async def _run_with_bounded_eof(
             watcher.start_soon(watch_eof)
             try:
                 await run()
+            except Exception as exc:  # noqa: BLE001 - preserve the original application error
+                application_error = exc
             finally:
                 finished.set()
                 watcher.cancel_scope.cancel()
+    if application_error is not None:
+        raise application_error
 
 
 async def run_streamablehttp_client(
