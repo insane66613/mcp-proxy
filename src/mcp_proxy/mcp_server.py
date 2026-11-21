@@ -452,7 +452,7 @@ def create_single_instance_routes(  # noqa: C901, PLR0915
                     )
                 finally:
                     _global_status["active_sse_connections"] -= 1
-        except Exception:
+        except Exception:  # noqa: BLE001 - response is already streaming
             # SSE response already started — cannot send HTTP error response.
             # Log and let the connection close gracefully.
             logger.warning(
