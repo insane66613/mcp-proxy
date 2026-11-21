@@ -2839,4 +2839,7 @@ async def test_cli_bearer_auth_covers_sse_and_streamable_http_without_forwarding
     finally:
         await _stop_stdio_proxy(process)
 
-    assert calls_file.read_text().splitlines() == ["streamable café ☕", "sse naïve résumé"]
+    assert calls_file.read_text(encoding="utf-8").splitlines() == [
+        "streamable café ☕",
+        "sse naïve résumé",
+    ]
