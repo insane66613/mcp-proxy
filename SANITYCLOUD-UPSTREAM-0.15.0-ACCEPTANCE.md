@@ -50,3 +50,12 @@ Independent [Microsoft Copilot Think deeper review](https://copilot.cloud.micros
 **Updated final local validation:** Windows **475 passed, 18 skipped** and Ubuntu/WSL **491 passed, 9 skipped**, zero failures on both. Repository Full gate reports zero failed Git, Ruff, Ruff formatting, Pylint, Mypy and pytest checks. Logs are listed above. Both test suites retain seven dependency deprecation warnings. No production source modules changed relative to the independently reviewed `a980a91` commit; the previously pinned wheel SHA-256 remains the accepted runtime artifact.
 
 **Residual limits:** Unexpected multi-task failures can legitimately yield an AnyIO exception group, the two-second EOF grace deliberately cancels unfinished work, and other untested reconnect interleavings may differ. Python 3.10–3.13 and other Linux distributions were not tested. Source acceptance does not satisfy service-specific authenticated gateway, manifest, rollback, and managed-supervisor promotion gates.
+
+
+## Independent follow-up review and F-12 closure — 2026-11-21
+
+The AiGentAI Microsoft Copilot Think deeper review of `ca9d9b683dd1bc2af11ab713679a267b5980ca5b` is at [the saved Copilot conversation](https://copilot.cloud.microsoft/chat/conversation/a79af193-2d54-4c72-98e7-95700b933bf4). Its **CONDITIONAL ACCEPT SOURCE** finding identified a **test-only** assertion weakness: an extra HTTP DELETE with an empty or unexpected session ID could pass the original count checks.
+
+The amended reconnect test now explicitly limits all DELETE keys to generation A or generation B, requires exactly one B DELETE, at most one A DELETE, and checks the total equals that allowed set. The normal single-generation test additionally requires a mapping exactly equal to its expected session ID and count. The previous tautological sum-of-all-counts check was removed.
+
+**Verified after correction:** Windows real subprocess CLI shutdown matrix 7 passed and Ubuntu/WSL corresponding matrix 14 passed, both zero failures. Repository-wide Ruff and formatting remained clean. No production source module or authentication/transport behavior was modified. This closes F-12 for the tested scenario, without claiming universal correctness for arbitrary reconnect interleavings. GitHub Actions and automated GitHub PR review were not invoked.

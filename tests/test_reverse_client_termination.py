@@ -350,10 +350,13 @@ async def test_cli_sigint_delete_shutdown_is_bounded_and_preserves_interrupt(  #
     if reconnect:
         assert generations == 2, generations
         assert losses == 1, losses
-        assert delete_by_session.get(f"{session_id}-1", 0) <= 1, delete_by_session
-        assert delete_by_session.get(f"{session_id}-2", 0) == 1, delete_by_session
-        assert delete_calls == sum(delete_by_session.values())
+        generation_a, generation_b = f"{session_id}-1", f"{session_id}-2"
+        assert set(delete_by_session) <= {generation_a, generation_b}, delete_by_session
+        assert delete_by_session.get(generation_a, 0) <= 1, delete_by_session
+        assert delete_by_session.get(generation_b, 0) == 1, delete_by_session
+        assert delete_calls == delete_by_session.get(generation_a, 0) + 1
     else:
+        assert delete_by_session == {session_id: 1}, delete_by_session
         assert delete_calls == 1, f"Expected one DELETE, observed {delete_calls}"
     assert exited_within_deadline, "CLI remained blocked past the five-second DELETE deadline"
     assert sigint_at is not None
